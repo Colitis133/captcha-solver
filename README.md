@@ -21,3 +21,13 @@ python -m captcha_solver.smoke_test
 # short training run
 python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 2 --batch-size 8
 ```
+
+Or use the bundled setup helper which creates a venv, installs deps, generates data,
+runs the smoke test and a short training run:
+
+```bash
+./setup_env.sh         # full flow (create .venv, install deps, make data, smoke test, short train)
+./setup_env.sh --no-data    # skip dataset generation
+./setup_env.sh --no-smoke   # skip smoke test
+./setup_env.sh --no-train   # skip the short training run
+```

@@ -58,10 +58,13 @@ class CRNN_AFFN(nn.Module):
         self.conv_proj = nn.Conv2d(128, 256, kernel_size=3, padding=1)
 
         # recurrent layers
-        self.rnn = nn.Sequential(
-            nn.LSTM(256, 128, bidirectional=True, batch_first=True),
-            nn.Dropout(dropout)
-        )
+        # The RNN input size depends on the convolutional feature height (collapsed)
+        # After two MaxPool2d(2,2) operations the feature height is img_h // 4
+        feat_h = max(1, img_h // 4)
+        rnn_input_size = 256 * feat_h
+        # use explicit modules because LSTM returns (output, (h,c)) not a Tensor
+        self.rnn_layer = nn.LSTM(rnn_input_size, 128, bidirectional=True, batch_first=True)
+        self.rnn_dropout = nn.Dropout(dropout)
 
         self.classifier = nn.Linear(128 * 2, n_classes)
 
@@ -77,8 +80,8 @@ class CRNN_AFFN(nn.Module):
         feat = feat.view(b, w, c * h)  # B, T, D
 
         # RNN
-        rnn_out, _ = self.rnn[0](feat)  # B, T, 2*H
-        rnn_out = self.rnn[1](rnn_out)
+        rnn_out, _ = self.rnn_layer(feat)  # B, T, 2*H
+        rnn_out = self.rnn_dropout(rnn_out)
 
         logits = self.classifier(rnn_out)  # B, T, n_classes
         # For CTC we need T, B, C
