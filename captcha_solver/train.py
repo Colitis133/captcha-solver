@@ -116,7 +116,7 @@ def parse_args():
     p.add_argument('--val-dir', type=str, default='data/val', help='directory with labeled val images')
     p.add_argument('--epochs', type=int, default=5)
     p.add_argument('--batch-size', type=int, default=16)
-    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--lr', type=float, default=5e-4)
     p.add_argument('--weight-decay', type=float, default=1e-5)
     p.add_argument('--dropout', type=float, default=0.25)
     p.add_argument('--img-w', type=int, default=160)

@@ -37,25 +37,28 @@ class CRNN_AFFN(nn.Module):
 
         # convolutional feature extractor
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 32, 3, stride=1, padding=1),
+            nn.Conv2d(1, 64, 3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
             nn.MaxPool2d(2, 2),  # H/2, W/2
+            nn.Dropout(0.25), # Added dropout
 
-            nn.Conv2d(32, 64, 3, padding=1),
+            nn.Conv2d(128, 256, 3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
             nn.MaxPool2d(2, 2),  # H/4, W/4
+            nn.Dropout(0.25), # Added dropout
 
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(128, 256, 3, padding=1), # Increased input from 64 to 128, output from 128 to 256
+            nn.BatchNorm2d(256), # Updated BatchNorm to 256 channels
             nn.ReLU(True),
         )
 
-        self.affn = AFFN(128)
+        self.affn = AFFN(256)
 
         # projection to sequence
-        self.conv_proj = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.conv_proj = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.conv_proj_dropout = nn.Dropout(0.25)
 
         # recurrent layers
         # The RNN input size depends on the convolutional feature height (collapsed)
@@ -72,7 +75,8 @@ class CRNN_AFFN(nn.Module):
         # x: B,1,H,W
         feat = self.cnn(x)
         feat = self.affn(feat)
-        feat = self.conv_proj(feat)  # B, C, H', W'
+        feat = self.conv_proj(feat)
+        feat = self.conv_proj_dropout(feat)  # B, C, H', W'
 
         # collapse height -> features, treat width dimension as time
         b, c, h, w = feat.size()
