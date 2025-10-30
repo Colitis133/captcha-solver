@@ -38,6 +38,9 @@ def train(args):
                             collate_fn=lambda b: collate_fn(b, char2idx)) if val_dataset else None
 
     best_loss = float('inf')
+    # early stopping state
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -55,9 +58,11 @@ def train(args):
 
         avg = epoch_loss / (len(train_loader) if len(train_loader) else 1)
         print(f"Epoch {epoch} avg loss: {avg:.4f}")
-        if avg < best_loss:
-            best_loss = avg
-            save_checkpoint(args.checkpoint, model, optimizer=optimizer, epoch=epoch)
+        # Save checkpoint on training loss improvement if no validation is available
+        if not val_loader:
+            if avg + 1e-12 < best_loss:
+                best_loss = avg
+                save_checkpoint(args.checkpoint, model, optimizer=optimizer, epoch=epoch)
 
         # validation
         if val_loader:
@@ -82,6 +87,21 @@ def train(args):
                     print('example pred/true:', pred[0], labels[0])
                     break
 
+            # Early stopping: monitor validation loss
+            if args.early_stop:
+                improved = (avg_val + args.min_delta) < best_val_loss
+                if improved:
+                    print(f"Validation loss improved ({best_val_loss:.4f} -> {avg_val:.4f}), saving checkpoint.")
+                    best_val_loss = avg_val
+                    epochs_no_improve = 0
+                    save_checkpoint(args.checkpoint, model, optimizer=optimizer, epoch=epoch)
+                else:
+                    epochs_no_improve += 1
+                    print(f"No improvement for {epochs_no_improve}/{args.patience} epochs.")
+                    if epochs_no_improve >= args.patience:
+                        print(f"Early stopping triggered (patience={args.patience}).")
+                        break
+
     # export
     if args.export:
         model.eval()
@@ -103,7 +123,13 @@ def parse_args():
     p.add_argument('--img-h', type=int, default=60)
     p.add_argument('--checkpoint', type=str, default='checkpoints/best.pt')
     p.add_argument('--export', type=str, default='captcha_model.pt')
-    p.add_argument('--use-cuda', action='store_true')
+        # Use CUDA by default when available. Pass --no-cuda to force CPU.
+        p.add_argument('--use-cuda', dest='use_cuda', action='store_true', help='use CUDA if available (deprecated, use --no-cuda to disable)')
+        p.add_argument('--no-cuda', dest='use_cuda', action='store_false', help='disable CUDA and use CPU')
+        p.set_defaults(use_cuda=True)
+    p.add_argument('--early-stop', action='store_true', help='enable early stopping based on validation loss')
+    p.add_argument('--patience', type=int, default=5, help='epochs with no improvement before stopping')
+    p.add_argument('--min-delta', type=float, default=1e-3, help='minimum change in monitored quantity to qualify as improvement')
     return p.parse_args()
 
 

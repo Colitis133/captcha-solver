@@ -31,3 +31,18 @@ runs the smoke test and a short training run:
 ./setup_env.sh --no-smoke   # skip smoke test
 ./setup_env.sh --no-train   # skip the short training run
 ```
+
+GPU notes
+---------
+
+Training will use a GPU by default when one is available. The training CLI accepts an opt-out flag:
+
+```bash
+# GPU enabled by default when available
+python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 10 --batch-size 32
+
+# force CPU
+python -m captcha_solver.train --no-cuda --train-dir data/train --val-dir data/val --epochs 10 --batch-size 32
+```
+
+If you need a specific CUDA-enabled PyTorch wheel, install that inside the venv before installing the rest of `requirements.txt`.
