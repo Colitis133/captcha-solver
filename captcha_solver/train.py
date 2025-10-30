@@ -123,10 +123,10 @@ def parse_args():
     p.add_argument('--img-h', type=int, default=60)
     p.add_argument('--checkpoint', type=str, default='checkpoints/best.pt')
     p.add_argument('--export', type=str, default='captcha_model.pt')
-        # Use CUDA by default when available. Pass --no-cuda to force CPU.
-        p.add_argument('--use-cuda', dest='use_cuda', action='store_true', help='use CUDA if available (deprecated, use --no-cuda to disable)')
-        p.add_argument('--no-cuda', dest='use_cuda', action='store_false', help='disable CUDA and use CPU')
-        p.set_defaults(use_cuda=True)
+    # Use CUDA by default when available. Pass --no-cuda to force CPU.
+    p.add_argument('--use-cuda', dest='use_cuda', action='store_true', help='use CUDA if available (deprecated, use --no-cuda to disable)')
+    p.add_argument('--no-cuda', dest='use_cuda', action='store_false', help='disable CUDA and use CPU')
+    p.set_defaults(use_cuda=True)
     p.add_argument('--early-stop', action='store_true', help='enable early stopping based on validation loss')
     p.add_argument('--patience', type=int, default=5, help='epochs with no improvement before stopping')
     p.add_argument('--min-delta', type=float, default=1e-3, help='minimum change in monitored quantity to qualify as improvement')
