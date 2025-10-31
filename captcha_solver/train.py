@@ -170,7 +170,7 @@ def parse_args():
     p.set_defaults(use_cuda=True)
     p.add_argument('--early-stop', dest='early_stop', action='store_true', help='enable early stopping based on validation loss')
     p.add_argument('--no-early-stop', dest='early_stop', action='store_false', help='disable early stopping')
-    p.set_defaults(early_stop=True)
+    p.set_defaults(early_stop=False)
     p.add_argument('--patience', type=int, default=5, help='epochs with no improvement before stopping')
     p.add_argument('--min-delta', type=float, default=1e-3, help='minimum change in monitored quantity to qualify as improvement')
     p.add_argument('--balance-styles', action='store_true', help='cycle batches across styles for the training split')

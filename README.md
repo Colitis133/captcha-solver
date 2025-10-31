@@ -21,6 +21,7 @@ python -m captcha_solver.smoke_test
 
 # short training run (residual CNN + BiLSTM, AMP/grad clipping on by default when CUDA is available)
 python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 2 --batch-size 8
+# add --early-stop if you want validation-based early stopping
 ```
 
 Or use the bundled setup helper which creates a venv, installs deps, generates data,
