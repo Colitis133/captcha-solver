@@ -6,10 +6,11 @@ split into train/ and val/ directories.
 import argparse
 import torch
 from torch import nn, optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .dataset import CaptchaDataset, collate_fn
+from .dataset import CaptchaDataset, collate_fn, StyleBalancedBatchSampler
 from .model import make_model
 from .utils import save_checkpoint, ctc_greedy_decode
 
@@ -32,8 +33,13 @@ def train(args):
     train_dataset = CaptchaDataset(args.train_dir, img_size=(args.img_w, args.img_h))
     val_dataset = CaptchaDataset(args.val_dir, img_size=(args.img_w, args.img_h)) if args.val_dir else None
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                              collate_fn=lambda b: collate_fn(b, char2idx))
+    if args.balance_styles and len(train_dataset.files) > 0:
+        batch_sampler = StyleBalancedBatchSampler(train_dataset, batch_size=args.batch_size)
+        train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler,
+                                  collate_fn=lambda b: collate_fn(b, char2idx))
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  collate_fn=lambda b: collate_fn(b, char2idx))
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             collate_fn=lambda b: collate_fn(b, char2idx)) if val_dataset else None
 
@@ -41,11 +47,17 @@ def train(args):
     # early stopping state
     best_val_loss = float('inf')
     epochs_no_improve = 0
+
+    scheduler = None
+    if val_loader and args.scheduler:
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=args.lr_gamma,
+                                      patience=args.lr_patience, verbose=True, min_lr=args.min_lr)
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         epoch_loss = 0.0
-        for imgs, targets, lengths, labels, _ in pbar:
+        for imgs, targets, lengths, labels, styles, _ in pbar:
             imgs = imgs.to(device)
             optimizer.zero_grad()
             logits = model(imgs)  # T,B,C
@@ -54,7 +66,9 @@ def train(args):
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-            pbar.set_postfix(loss=epoch_loss)
+            lr = optimizer.param_groups[0]['lr']
+            unique_styles = len(set(styles))
+            pbar.set_postfix(loss=loss.item(), lr=lr, styles=unique_styles)
 
         avg = epoch_loss / (len(train_loader) if len(train_loader) else 1)
         print(f"Epoch {epoch} avg loss: {avg:.4f}")
@@ -69,7 +83,7 @@ def train(args):
             model.eval()
             val_loss = 0.0
             with torch.no_grad():
-                for imgs, targets, lengths, labels, _ in val_loader:
+                for imgs, targets, lengths, labels, styles, _ in val_loader:
                     imgs = imgs.to(device)
                     logits = model(imgs)
                     input_lengths = torch.full((logits.size(1),), logits.size(0), dtype=torch.long)
@@ -80,27 +94,28 @@ def train(args):
 
             # show a sample prediction
             with torch.no_grad():
-                for imgs, targets, lengths, labels, _ in val_loader:
+                for imgs, targets, lengths, labels, styles, _ in val_loader:
                     imgs = imgs.to(device)
                     logits = model(imgs)
                     pred = ctc_greedy_decode(logits, idx2char)
                     print('example pred/true:', pred[0], labels[0])
                     break
 
-            # Early stopping: monitor validation loss
-            if args.early_stop:
-                improved = (avg_val + args.min_delta) < best_val_loss
-                if improved:
-                    print(f"Validation loss improved ({best_val_loss:.4f} -> {avg_val:.4f}), saving checkpoint.")
-                    best_val_loss = avg_val
-                    epochs_no_improve = 0
-                    save_checkpoint(args.checkpoint, model, optimizer=optimizer, epoch=epoch)
-                else:
-                    epochs_no_improve += 1
-                    print(f"No improvement for {epochs_no_improve}/{args.patience} epochs.")
-                    if epochs_no_improve >= args.patience:
-                        print(f"Early stopping triggered (patience={args.patience}).")
-                        break
+            if scheduler:
+                scheduler.step(avg_val)
+
+            improved = (avg_val + args.min_delta) < best_val_loss
+            if improved:
+                print(f"Validation loss improved ({best_val_loss:.4f} -> {avg_val:.4f}), saving checkpoint.")
+                best_val_loss = avg_val
+                epochs_no_improve = 0
+                save_checkpoint(args.checkpoint, model, optimizer=optimizer, epoch=epoch)
+            elif args.early_stop:
+                epochs_no_improve += 1
+                print(f"No improvement for {epochs_no_improve}/{args.patience} epochs.")
+                if epochs_no_improve >= args.patience:
+                    print(f"Early stopping triggered (patience={args.patience}).")
+                    break
 
     # export
     if args.export:
@@ -127,9 +142,20 @@ def parse_args():
     p.add_argument('--use-cuda', dest='use_cuda', action='store_true', help='use CUDA if available (deprecated, use --no-cuda to disable)')
     p.add_argument('--no-cuda', dest='use_cuda', action='store_false', help='disable CUDA and use CPU')
     p.set_defaults(use_cuda=True)
-    p.add_argument('--early-stop', action='store_true', help='enable early stopping based on validation loss')
+    p.add_argument('--early-stop', dest='early_stop', action='store_true', help='enable early stopping based on validation loss')
+    p.add_argument('--no-early-stop', dest='early_stop', action='store_false', help='disable early stopping')
+    p.set_defaults(early_stop=True)
     p.add_argument('--patience', type=int, default=5, help='epochs with no improvement before stopping')
     p.add_argument('--min-delta', type=float, default=1e-3, help='minimum change in monitored quantity to qualify as improvement')
+    p.add_argument('--balance-styles', action='store_true', help='cycle batches across styles for the training split')
+    p.add_argument('--no-balance-styles', dest='balance_styles', action='store_false')
+    p.set_defaults(balance_styles=True)
+    p.add_argument('--scheduler', action='store_true', help='enable ReduceLROnPlateau scheduler on validation loss')
+    p.add_argument('--no-scheduler', dest='scheduler', action='store_false')
+    p.set_defaults(scheduler=True)
+    p.add_argument('--lr-patience', type=int, default=2, help='epochs with no val improvement before LR decay')
+    p.add_argument('--lr-gamma', type=float, default=0.5, help='multiplicative LR decay factor when scheduler steps')
+    p.add_argument('--min-lr', type=float, default=1e-6, help='floor for the learning rate when scheduler is active')
     return p.parse_args()
 
 
