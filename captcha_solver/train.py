@@ -1,11 +1,9 @@
-"""Training script for CAPTCHA solver (small, runnable example).
+"""Training script for CAPTCHA solver."""
 
-This script provides a convenient entrypoint for training on a synthetic dataset
-split into train/ and val/ directories.
-"""
 import argparse
 import torch
-from torch import nn, optim
+from torch import nn, optim, amp
+from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -24,11 +22,29 @@ def train(args):
 
     device = torch.device('cuda' if torch.cuda.is_available() and args.use_cuda else 'cpu')
 
-    model = make_model(n_classes, img_h=args.img_h, img_w=args.img_w, dropout=args.dropout)
+    cnn_channels = tuple(args.cnn_channels) if args.cnn_channels else (64, 128, 256, 512)
+    if len(cnn_channels) != 4:
+        raise ValueError('--cnn-channels expects exactly four integers, e.g. 64 128 256 512')
+
+    model = make_model(
+        n_classes,
+        img_h=args.img_h,
+        img_w=args.img_w,
+        dropout=args.dropout,
+        cnn_channels=cnn_channels,
+        lstm_hidden=args.lstm_hidden,
+        lstm_layers=args.lstm_layers,
+    )
     model.to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+
+    amp_enabled = args.amp and device.type == 'cuda'
+    if torch.cuda.is_available():
+        scaler = amp.GradScaler('cuda', enabled=amp_enabled)
+    else:
+        scaler = amp.GradScaler('cpu', enabled=False)
 
     train_dataset = CaptchaDataset(args.train_dir, img_size=(args.img_w, args.img_h))
     val_dataset = CaptchaDataset(args.val_dir, img_size=(args.img_w, args.img_h)) if args.val_dir else None
@@ -59,12 +75,17 @@ def train(args):
         epoch_loss = 0.0
         for imgs, targets, lengths, labels, styles, _ in pbar:
             imgs = imgs.to(device)
-            optimizer.zero_grad()
-            logits = model(imgs)  # T,B,C
-            input_lengths = torch.full((logits.size(1),), logits.size(0), dtype=torch.long)
-            loss = criterion(logits.log_softmax(2), targets, input_lengths, lengths)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast('cuda', enabled=amp_enabled):
+                logits = model(imgs)
+                input_lengths = torch.full((logits.size(1),), logits.size(0), dtype=torch.long)
+                loss = criterion(logits.log_softmax(2), targets, input_lengths, lengths)
+            scaler.scale(loss).backward()
+            if args.max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
             epoch_loss += loss.item()
             lr = optimizer.param_groups[0]['lr']
             unique_styles = len(set(styles))
@@ -85,9 +106,10 @@ def train(args):
             with torch.no_grad():
                 for imgs, targets, lengths, labels, styles, _ in val_loader:
                     imgs = imgs.to(device)
-                    logits = model(imgs)
-                    input_lengths = torch.full((logits.size(1),), logits.size(0), dtype=torch.long)
-                    loss = criterion(logits.log_softmax(2), targets, input_lengths, lengths)
+                    with amp.autocast('cuda', enabled=amp_enabled):
+                        logits = model(imgs)
+                        input_lengths = torch.full((logits.size(1),), logits.size(0), dtype=torch.long)
+                        loss = criterion(logits.log_softmax(2), targets, input_lengths, lengths)
                     val_loss += loss.item()
             avg_val = val_loss / (len(val_loader) if len(val_loader) else 1)
             print(f"Validation avg loss: {avg_val:.4f}")
@@ -160,6 +182,13 @@ def parse_args():
     p.add_argument('--lr-patience', type=int, default=2, help='epochs with no val improvement before LR decay')
     p.add_argument('--lr-gamma', type=float, default=0.5, help='multiplicative LR decay factor when scheduler steps')
     p.add_argument('--min-lr', type=float, default=1e-6, help='floor for the learning rate when scheduler is active')
+    p.add_argument('--cnn-channels', type=int, nargs='+', default=None, help='Override CNN channel widths (4 ints)')
+    p.add_argument('--lstm-hidden', type=int, default=256, help='Hidden size of BiLSTM layers')
+    p.add_argument('--lstm-layers', type=int, default=2, help='Number of stacked BiLSTM layers')
+    p.add_argument('--max-grad-norm', type=float, default=5.0, help='Gradient clipping norm (<=0 disables)')
+    p.add_argument('--amp', dest='amp', action='store_true', help='Enable mixed precision when CUDA is available')
+    p.add_argument('--no-amp', dest='amp', action='store_false', help='Disable mixed precision')
+    p.set_defaults(amp=True)
     return p.parse_args()
 
 

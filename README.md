@@ -19,7 +19,7 @@ python generate_dataset.py --out data
 # quick smoke test
 python -m captcha_solver.smoke_test
 
-# short training run
+# short training run (residual CNN + BiLSTM, AMP/grad clipping on by default when CUDA is available)
 python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 2 --batch-size 8
 ```
 
