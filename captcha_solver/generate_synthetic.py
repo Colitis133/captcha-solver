@@ -18,6 +18,7 @@ import os
 import cv2
 import enum
 from io import BytesIO
+from functools import lru_cache
 
 
 DEFAULT_CHARS = string.ascii_uppercase + string.digits
@@ -54,6 +55,7 @@ def random_text(length: int = None, chars: str = DEFAULT_CHARS):
     return ''.join(random.choice(chars) for _ in range(length))
 
 
+@lru_cache(maxsize=8)
 def _find_local_fonts(dirpath="fonts"):
     if not os.path.isdir(dirpath):
         return []
@@ -63,7 +65,14 @@ def _find_local_fonts(dirpath="fonts"):
         for f in files:
             if f.lower().endswith(exts):
                 fonts.append(os.path.join(root, f))
-    return fonts
+    valid_fonts = []
+    for path in fonts:
+        try:
+            ImageFont.truetype(path, size=32)
+            valid_fonts.append(path)
+        except OSError:
+            print(f"Warning: Skipping unsupported font file '{path}'.")
+    return valid_fonts
 
 
 def _add_textured_background(img, intensity=0.12):
