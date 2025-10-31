@@ -149,8 +149,14 @@ def gen_captcha(text=None, width=160, height=60, fonts=None):
         fonts = _find_local_fonts()
 
     # gentle off-white background to simulate scanning or compression
-    bg_base = 245 + random.randint(-8, 8)
-    img = Image.new('RGB', (width, height), color=(bg_base, bg_base, bg_base))
+    bg_choice = random.choice(['blue', 'purple', 'red'])
+    if bg_choice == 'blue':
+        bg_color = (random.randint(200, 230), random.randint(210, 240), random.randint(230, 255))
+    elif bg_choice == 'purple':
+        bg_color = (random.randint(220, 240), random.randint(200, 230), random.randint(220, 240))
+    else: # red
+        bg_color = (random.randint(240, 255), random.randint(200, 220), random.randint(200, 220))
+    img = Image.new('RGB', (width, height), color=bg_color)
     draw = ImageDraw.Draw(img)
 
     # choose font
@@ -166,6 +172,17 @@ def gen_captcha(text=None, width=160, height=60, fonts=None):
     # draw text with per-character jitter and slight darkness variation
     x = int(width * 0.05)
     for ch in text:
+        # Choose a random font for each character
+        font = None
+        if fonts:
+            try:
+                font_path = random.choice(fonts)
+                font = ImageFont.truetype(font_path, size=int(height * random.uniform(0.6, 0.8)))
+            except Exception:
+                font = None
+        if font is None:
+            font = ImageFont.load_default()
+
         y_jitter = random.randint(-6, 6)
         # getsize / getbbox depending on PIL version
         try:
@@ -181,11 +198,11 @@ def gen_captcha(text=None, width=160, height=60, fonts=None):
         shade = random.randint(0, 70)
         draw.text((x, max(0, (height - h) // 2 + y_jitter)), ch,
                   fill=(shade, shade, shade), font=font)
-        x += w + random.randint(0, 6)
+        x += w + random.randint(-4, 4) # Allow some overlap for artistic fonts
 
     # small gaussian blur sometimes
-    if random.random() < 0.6:
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.random() * 1.2))
+    if random.random() < 0.1:
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.random() * 0.5))
 
     draw = ImageDraw.Draw(img)
 
