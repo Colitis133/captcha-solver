@@ -51,7 +51,7 @@ def train(args):
     scheduler = None
     if val_loader and args.scheduler:
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=args.lr_gamma,
-                                      patience=args.lr_patience, verbose=True, min_lr=args.min_lr)
+                                      patience=args.lr_patience, min_lr=args.min_lr)
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -102,7 +102,11 @@ def train(args):
                     break
 
             if scheduler:
+                prev_lr = optimizer.param_groups[0]['lr']
                 scheduler.step(avg_val)
+                new_lr = optimizer.param_groups[0]['lr']
+                if new_lr < prev_lr:
+                    print(f"Scheduler reduced lr: {prev_lr:.6f} -> {new_lr:.6f}")
 
             improved = (avg_val + args.min_delta) < best_val_loss
             if improved:

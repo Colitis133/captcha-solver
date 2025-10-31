@@ -38,20 +38,20 @@ class CRNN_AFFN(nn.Module):
         # convolutional feature extractor
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),  # H/2, W/2
-            nn.Dropout(0.25), # Added dropout
+            nn.Dropout(dropout),
+
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # H/4, W/4
+            nn.Dropout(dropout),
 
             nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.MaxPool2d(2, 2),  # H/4, W/4
-            nn.Dropout(0.25), # Added dropout
-
-            nn.Conv2d(128, 256, 3, padding=1), # Increased input from 64 to 128, output from 128 to 256
-            nn.BatchNorm2d(256), # Updated BatchNorm to 256 channels
-            nn.ReLU(True),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
         )
 
         self.affn = AFFN(256)
