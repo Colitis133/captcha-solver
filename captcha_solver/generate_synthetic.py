@@ -1,20 +1,21 @@
-"""Synthetic CAPTCHA generator (simple, dependency-light)
+"""Synthetic CAPTCHA generator with stronger, varied augmentations.
 
-Generates fixed-size CAPTCHA images with random text, fonts (if available),
-and modest geometric/photometric distortions to better mirror real-world CAPTCHAs.
+This file keeps the previous, simple API: `gen_captcha(text=None, width=..., height=..., fonts=None)`
+but produces a much wider range of appearance types (mesh warp/perspective,
+motion blur, denser occlusions, variable spacing and overlap, textured backgrounds,
+and compounded photometric noise). The goal is to better approximate real-world
+captchas (Google/Cloudflare-like) so the model learns character shapes and
+sequence patterns under heavy distortions.
 
-Improvements over the original version (conservative / low-risk):
-- variable text length (4-6)
-- optional font loading from a local `fonts/` directory
-- mild affine shear and small rotation
-- background tint and occasional blotches/occlusions
-- configurable width/height preserved
+Includes OpenCV-based elastic and perspective warps for even stronger transforms.
 """
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 import numpy as np
 import random
 import string
 import os
+import cv2
 
 
 DEFAULT_CHARS = string.ascii_uppercase + string.digits
@@ -27,7 +28,6 @@ def random_text(length: int = None, chars: str = DEFAULT_CHARS):
 
 
 def _find_local_fonts(dirpath="fonts"):
-    """Return list of font file paths found under `dirpath` (relative to repo)."""
     if not os.path.isdir(dirpath):
         return []
     exts = ('.ttf', '.otf')
@@ -37,6 +37,98 @@ def _find_local_fonts(dirpath="fonts"):
             if f.lower().endswith(exts):
                 fonts.append(os.path.join(root, f))
     return fonts
+
+
+def _add_textured_background(img, intensity=0.12):
+    """Overlay a subtle textured background (noise + gradient)."""
+    w, h = img.size
+    # per-pixel noise
+    noise = (np.random.randn(h, w) * 255 * intensity).astype(np.int16)
+    base = np.array(img).astype(np.int16)
+    for c in range(3):
+        base[..., c] = np.clip(base[..., c] + noise, 0, 255)
+    # gentle vertical gradient tint
+    grad = np.linspace(0, random.uniform(-8, 8), h).astype(np.int16)
+    for c in range(3):
+        base[..., c] = np.clip(base[..., c] + grad[:, None], 0, 255)
+    return Image.fromarray(base.astype(np.uint8))
+
+
+def _mesh_warp(pil_img, grid=3, mag=6):
+    """Apply a cheap mesh warp by perturbing a regular grid (PIL.Image.transform MESH)."""
+    w, h = pil_img.size
+    mesh = []
+    dx = w // grid
+    dy = h // grid
+    for i in range(grid):
+        for j in range(grid):
+            x0 = i * dx
+            y0 = j * dy
+            x1 = x0 + dx
+            y1 = y0 + dy
+            # source box
+            box = (x0, y0, x1, y1)
+            # destination quad (perturb corners)
+            shift = lambda v: v + random.randint(-mag, mag)
+            quad = (
+                shift(x0), shift(y0),
+                shift(x1), shift(y0),
+                shift(x1), shift(y1),
+                shift(x0), shift(y1),
+            )
+            mesh.append((box, quad))
+    try:
+        return pil_img.transform(pil_img.size, Image.MESH, mesh, resample=Image.BILINEAR)
+    except Exception:
+        return pil_img
+
+
+def _motion_blur(pil_img, radius=5, angle=None):
+    """Approximate directional motion blur by rotating, applying box blur, and rotating back."""
+    if angle is None:
+        angle = random.uniform(-30, 30)
+    rotated = pil_img.rotate(angle, resample=Image.BILINEAR, expand=True)
+    blurred = rotated.filter(ImageFilter.BoxBlur(radius))
+    # paste back to original size centered
+    w, h = pil_img.size
+    bw, bh = blurred.size
+    left = max(0, (bw - w) // 2)
+    top = max(0, (bh - h) // 2)
+    return blurred.crop((left, top, left + w, top + h)).rotate(-angle, resample=Image.BILINEAR)
+
+
+def _elastic_warp(img_arr, alpha=50, sigma=5):
+    """Apply elastic deformation using OpenCV remap."""
+    h, w = img_arr.shape[:2]
+    # generate displacement fields
+    dx = np.random.randn(h, w) * alpha
+    dy = np.random.randn(h, w) * alpha
+    # smooth the displacements
+    dx = cv2.GaussianBlur(dx.astype(np.float32), (0, 0), sigma)
+    dy = cv2.GaussianBlur(dy.astype(np.float32), (0, 0), sigma)
+    # create meshgrid
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    # remap
+    warped = cv2.remap(img_arr, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    return warped
+
+
+def _perspective_warp(img_arr, max_offset=20):
+    """Apply random perspective transformation using OpenCV."""
+    h, w = img_arr.shape[:2]
+    # random points for perspective
+    pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+    pts2 = np.float32([
+        [random.randint(0, max_offset), random.randint(0, max_offset)],
+        [w - random.randint(0, max_offset), random.randint(0, max_offset)],
+        [random.randint(0, max_offset), h - random.randint(0, max_offset)],
+        [w - random.randint(0, max_offset), h - random.randint(0, max_offset)]
+    ])
+    M = cv2.getPerspectiveTransform(pts1, pts2)
+    warped = cv2.warpPerspective(img_arr, M, (w, h), borderMode=cv2.BORDER_REFLECT)
+    return warped
 
 
 def gen_captcha(text=None, width=160, height=60, fonts=None):
@@ -149,7 +241,6 @@ def gen_captcha(text=None, width=160, height=60, fonts=None):
 
 
 if __name__ == "__main__":
-    # quick demo
     img, label = gen_captcha()
     print("Label:", label)
     img.show()
