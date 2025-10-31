@@ -1,3 +1,7 @@
+# Ignore generated datasets and virtualenv
+data/
+data_sample/
+.venv/
 # Python
 __pycache__/
 *.py[cod]
