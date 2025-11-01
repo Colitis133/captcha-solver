@@ -1,6 +1,5 @@
-"""Captcha solver package"""
+"""CAPTCHA tooling package."""
 
-from .dataset import CaptchaDataset
-from .model import CRNN_AFFN
+from .generate_synthetic import gen_captcha, CaptchaStyle
 
-__all__ = ["CaptchaDataset", "CRNN_AFFN"]
+__all__ = ["gen_captcha", "CaptchaStyle"]

@@ -1,6 +1,2 @@
-torch>=2.1
-torchvision
-Pillow
 numpy
-opencv-python-headless
-tqdm
+Pillow

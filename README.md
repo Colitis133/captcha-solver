@@ -1,58 +1,80 @@
-# CRNN + AFFN CAPTCHA Solver
+# CAPTCHA Dataset + PaddleOCR Finetuning Guide
 
-Quick runnable project that trains a small CRNN+AFFN model on synthetic CAPTCHA data.
+This repository now focuses on generating synthetic CAPTCHA data and preparing label
+manifests so you can fine-tune an open-source OCR stack such as PaddleOCR.
 
-See `generate_dataset.py` to create the synthetic dataset (defaults to 2,000 train images
-balanced across the 20 training styles, plus 500 validation images from the Mutant Hybrid style).
+The previous in-house CRNN training code has been archived on the
+`backup-crnn-legacy` branch should you need it in the future.
 
-Usage (Linux):
+## Synthetic dataset
+
+Use `generate_dataset.py` to produce the train/validation splits. By default it
+creates 2,000 training images spread evenly across 20 styles and 500 validation
+images of the "Mutant Hybrid" style.
 
 ```bash
-cd ~/captcha_project
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# generate data (2,000 train / 500 val by default)
 python generate_dataset.py --out data
-
-# quick smoke test
-python -m captcha_solver.smoke_test
-
-# short training run (residual CNN + BiLSTM, AMP/grad clipping on by default when CUDA is available)
-python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 2 --batch-size 8
-# add --early-stop if you want validation-based early stopping
 ```
 
-Or use the bundled setup helper which creates a venv, installs deps, generates data,
-runs the smoke test and a short training run:
+Fonts live under `fonts/` so generation works offline. Feel free to drop in
+additional `.ttf` files—they are picked up automatically.
+
+## Prepare PaddleOCR label files
+
+PaddleOCR expects manifest files where each line contains the relative image
+path and the corresponding label separated by a tab. Generate these manifests
+after you create the dataset:
 
 ```bash
-./setup_env.sh         # full flow (create .venv, install deps, make data, smoke test, short train)
-./setup_env.sh --no-data    # skip dataset generation
-./setup_env.sh --no-smoke   # skip smoke test
-./setup_env.sh --no-train   # skip the short training run
+python prepare_paddle_labels.py \
+  --train-dir data/train \
+  --val-dir data/val \
+  --base-dir . \
+  --output-dir paddle_ocr/labels
 ```
 
-Fonts
------
+This writes `paddle_ocr/labels/train_label.txt` and
+`paddle_ocr/labels/val_label.txt`.
 
-The repository vendors a small set of open-licensed fonts under `fonts/` so every generator
-style works out of the box and offline. See `fonts/README.md` for the list of families and
-their licenses. Feel free to add more `.ttf` files to that directory if you want additional
-visual variety—styles will automatically pick them up.
+## Fine-tune PaddleOCR
 
-GPU notes
----------
+1. Clone the [PaddleOCR repository](https://github.com/PaddlePaddle/PaddleOCR)
+	and follow their installation guide for your platform (GPU strongly
+	recommended).
+2. Copy the character dictionary provided here (`paddle_ocr/charset.txt`) to
+	the PaddleOCR workspace or reference it via an absolute path.
+3. Launch fine-tuning using their recognition config, overriding the data paths
+	and charset. Example command:
 
-Training will use a GPU by default when one is available. The training CLI accepts an opt-out flag:
+	```bash
+	export PADDLE_OCR_ROOT=/path/to/PaddleOCR
+	python ${PADDLE_OCR_ROOT}/tools/train.py \
+	  -c ${PADDLE_OCR_ROOT}/configs/rec/rec_mv3_none_bilstm_ctc.yml \
+	  -o Global.pretrained_model=${PADDLE_OCR_ROOT}/pretrained/rec_mv3_none_bilstm_ctc/best_accuracy \
+		  Global.save_model_dir=output/rec_mv3_finetune \
+		  Global.character_dict_path=$(pwd)/paddle_ocr/charset.txt \
+		  Train.dataset.data_dir=$(pwd) \
+		  Train.dataset.label_file_list[0]=$(pwd)/paddle_ocr/labels/train_label.txt \
+		  Eval.dataset.data_dir=$(pwd) \
+		  Eval.dataset.label_file_list[0]=$(pwd)/paddle_ocr/labels/val_label.txt \
+		  Global.max_text_length=8 \
+		  Optimizer.lr.learning_rate=0.0003
+	```
 
-```bash
-# GPU enabled by default when available
-python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 10 --batch-size 32
+	Tweak the learning rate, batch size, and schedule to suit your hardware and
+	convergence.
 
-# force CPU
-python -m captcha_solver.train --no-cuda --train-dir data/train --val-dir data/val --epochs 10 --batch-size 32
+4. Export the recognition model with `tools/export_model.py` once validation
+	performance is stable.
+
+## Requirements
+
+The Python dependencies required for dataset generation and label preparation
+are minimal:
+
+```
+pip install -r requirements.txt
 ```
 
-If you need a specific CUDA-enabled PyTorch wheel, install that inside the venv before installing the rest of `requirements.txt`.
+Install PaddleOCR and PaddlePaddle separately according to their official
+instructions—they are not pulled in by the default requirements file.

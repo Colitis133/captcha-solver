@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Create venv, install deps, generate dataset, run smoke test, and short training run
+# Create venv, install deps, generate dataset, and prepare PaddleOCR labels.
 ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT_DIR"
 
@@ -10,13 +10,10 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# Generate synthetic dataset (2000 images default)
-python generate_dataset.py --total 2000 --out data
+# Generate synthetic dataset (2,000 train / 500 val by default)
+python generate_dataset.py --out data
 
-# Smoke test
-python -m captcha_solver.smoke_test
-
-# Short training run
-python -m captcha_solver.train --train-dir data/train --val-dir data/val --epochs 2 --batch-size 8
+# Prepare PaddleOCR manifests
+python prepare_paddle_labels.py --train-dir data/train --val-dir data/val --output-dir paddle_ocr/labels
 
 echo "Done"
