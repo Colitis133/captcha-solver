@@ -1,7 +1,7 @@
 """Dataset and transforms for CAPTCHA images."""
 from collections import defaultdict, deque
 from torch.utils.data import Dataset, Sampler
-from PIL import Image
+from PIL import Image, ImageStat
 import os
 import re
 import random
@@ -13,22 +13,52 @@ from .generate_synthetic import gen_captcha
 FILENAME_LABEL_RE = re.compile(r"([A-Za-z0-9]+)_.*\.(?:png|jpg|jpeg)$")
 
 
+def _is_useful_image(path: str, min_stddev: float = 4.0) -> bool:
+    """Return False for unreadable files or nearly blank images."""
+    try:
+        with Image.open(path) as img:
+            gray = img.convert('L')
+            stat = ImageStat.Stat(gray)
+            stddev = stat.stddev[0] if stat.stddev else 0.0
+            return stddev >= min_stddev
+    except (OSError, ValueError):
+        return False
+
+
 class CaptchaDataset(Dataset):
     """Loads images from a folder and optionally mixes synthetic samples.
 
     Filename labels must be embedded, e.g., `A7K9P_42.png`.
     """
 
-    def __init__(self, root_dir, img_size=(160, 60), use_synthetic=False, synth_ratio=0.5, transform=None):
+    def __init__(
+        self,
+        root_dir,
+        img_size=(160, 60),
+        use_synthetic=False,
+        synth_ratio=0.5,
+        transform=None,
+        allowed_styles=None,
+    ):
         self.root_dir = root_dir
         self.files = []
         self.styles = []
+        allowed = {s.lower() for s in allowed_styles} if allowed_styles else None
         for dirpath, _, filenames in os.walk(root_dir):
             style = os.path.basename(dirpath) if dirpath != root_dir else ""  # root-level style marker
             for fname in filenames:
                 if not fname.lower().endswith(('.png', '.jpg', '.jpeg')):
                     continue
-                self.files.append(os.path.join(dirpath, fname))
+                full_path = os.path.join(dirpath, fname)
+                label = self._label_from_filename(full_path)
+                if not label:
+                    continue
+                style_key = style.lower()
+                if allowed is not None and style_key not in allowed:
+                    continue
+                if not _is_useful_image(full_path):
+                    continue
+                self.files.append(full_path)
                 self.styles.append(style)
         self.img_size = img_size
         self.use_synthetic = use_synthetic

@@ -46,16 +46,40 @@ def train(args):
     else:
         scaler = amp.GradScaler('cpu', enabled=False)
 
-    train_dataset = CaptchaDataset(args.train_dir, img_size=(args.img_w, args.img_h))
-    val_dataset = CaptchaDataset(args.val_dir, img_size=(args.img_w, args.img_h)) if args.val_dir else None
+    def build_train_loader(style_filter=None):
+        dataset = CaptchaDataset(
+            args.train_dir,
+            img_size=(args.img_w, args.img_h),
+            allowed_styles=style_filter,
+        )
+        if len(dataset.files) == 0:
+            return dataset, None
+        if args.balance_styles and len(dataset.files) > 0:
+            sampler = StyleBalancedBatchSampler(dataset, batch_size=args.batch_size)
+            loader = DataLoader(dataset, batch_sampler=sampler,
+                                collate_fn=lambda b: collate_fn(b, char2idx))
+        else:
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                                collate_fn=lambda b: collate_fn(b, char2idx))
+        return dataset, loader
 
-    if args.balance_styles and len(train_dataset.files) > 0:
-        batch_sampler = StyleBalancedBatchSampler(train_dataset, batch_size=args.batch_size)
-        train_loader = DataLoader(train_dataset, batch_sampler=batch_sampler,
-                                  collate_fn=lambda b: collate_fn(b, char2idx))
-    else:
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                  collate_fn=lambda b: collate_fn(b, char2idx))
+    full_dataset, full_loader = build_train_loader()
+    if full_loader is None:
+        raise ValueError(f"No training images found under '{args.train_dir}'.")
+
+    easy_loader = None
+    if args.curriculum_epochs <= 0:
+        raise ValueError("Curriculum warmup is compulsory; --curriculum-epochs must be a positive integer.")
+
+    easy_styles = {s.lower() for s in args.easy_styles}
+    easy_dataset, easy_loader = build_train_loader(easy_styles)
+    if easy_loader is None:
+        raise ValueError(
+            "Curriculum warmup is compulsory but no samples found for the requested easy styles."
+        )
+    print(f"Curriculum warmup: using styles {sorted(easy_styles)} for the first {args.curriculum_epochs} epochs.")
+
+    val_dataset = CaptchaDataset(args.val_dir, img_size=(args.img_w, args.img_h)) if args.val_dir else None
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             collate_fn=lambda b: collate_fn(b, char2idx)) if val_dataset else None
 
@@ -71,7 +95,10 @@ def train(args):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        use_easy = easy_loader is not None and epoch <= args.curriculum_epochs
+        active_loader = easy_loader if use_easy else full_loader
+        phase_suffix = " [easy warmup]" if use_easy else ""
+        pbar = tqdm(active_loader, desc=f"Epoch {epoch}{phase_suffix}")
         epoch_loss = 0.0
         for imgs, targets, lengths, labels, styles, _ in pbar:
             imgs = imgs.to(device)
@@ -91,7 +118,8 @@ def train(args):
             unique_styles = len(set(styles))
             pbar.set_postfix(loss=loss.item(), lr=lr, styles=unique_styles)
 
-        avg = epoch_loss / (len(train_loader) if len(train_loader) else 1)
+        loader_len = len(active_loader) if len(active_loader) else 1
+        avg = epoch_loss / loader_len
         print(f"Epoch {epoch} avg loss: {avg:.4f}")
         # Save checkpoint on training loss improvement if no validation is available
         if not val_loader:
@@ -189,6 +217,17 @@ def parse_args():
     p.add_argument('--amp', dest='amp', action='store_true', help='Enable mixed precision when CUDA is available')
     p.add_argument('--no-amp', dest='amp', action='store_false', help='Disable mixed precision')
     p.set_defaults(amp=True)
+    p.add_argument('--curriculum-epochs', type=int, default=6, help='positive number of epochs to train only on easy styles before mixing hard ones')
+    p.add_argument('--easy-styles', nargs='+', default=[
+        'mixed_fonts_mayhem',
+        'bold_chaos',
+        'high_contrast_ink',
+        'thick_shadows',
+        'google_classic',
+        'cartoon_comic',
+        'tilted_type',
+        'grunge_texture',
+    ], help='style folder names to emphasize during the compulsory curriculum warmup')
     return p.parse_args()
 
 

@@ -10,7 +10,7 @@ sequence patterns under heavy distortions.
 Includes OpenCV-based elastic and perspective warps for even stronger transforms.
 """
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageEnhance, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageEnhance, ImageOps, ImageStat
 import numpy as np
 import random
 import string
@@ -570,40 +570,70 @@ def _style_thick_shadows(base_img, text, width, height, fonts):
 
 
 def _style_tilted_type(base_img, text, width, height, fonts):
-    """Style 12: Characters individually rotated at random angles with a zigzag baseline."""
+    """Style 12: Rotated characters with zigzag baseline, resized to stay within bounds."""
+    bg_color = (255, 255, 255)
+    max_attempts = 4
+    margin = int(width * 0.05)
+
+    for attempt in range(max_attempts):
+        scale = 0.78 - attempt * 0.08
+        font_size = int(height * scale)
+        if font_size < max(16, int(height * 0.45)):
+            font_size = max(16, int(height * 0.45))
+
+        img = base_img.copy()
+        img.paste(bg_color, (0, 0, width, height))
+
+        glyphs = []
+        x_pos = margin
+        y_center = height // 2
+        overflow = False
+
+        for char in text:
+            font_path = random.choice(fonts) if fonts else None
+            font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+            rotation = random.uniform(-22, 22)
+
+            bbox = font.getbbox(char)
+            char_w = bbox[2] - bbox[0]
+            char_h = bbox[3] - bbox[1]
+            canvas = Image.new('RGBA', (char_w + font_size, char_h + font_size), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(canvas)
+            draw.text((-bbox[0], -bbox[1]), char, font=font, fill=(0, 0, 0))
+
+            rotated = canvas.rotate(rotation, expand=True, resample=Image.BILINEAR)
+            y_offset = y_center - rotated.height // 2 + random.randint(-height // 7, height // 7)
+
+            if x_pos + rotated.width > width - margin:
+                overflow = True
+                break
+
+            glyphs.append((rotated, (x_pos, y_offset)))
+            step = max(int(rotated.width * random.uniform(0.75, 0.9)), 1)
+            x_pos += step
+
+        if overflow:
+            continue
+
+        for rotated, (gx, gy) in glyphs:
+            img.paste(rotated, (gx, gy), rotated)
+
+        arr = np.array(img).astype(np.float32)
+        noise = np.random.normal(0, 11, arr.shape)
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
+    # Fallback: if all attempts overflow, just shrink text without rotation.
     img = base_img.copy()
+    img.paste(bg_color, (0, 0, width, height))
+    font_path = random.choice(fonts) if fonts else None
+    font = ImageFont.truetype(font_path, int(height * 0.5)) if font_path else ImageFont.load_default()
     draw = ImageDraw.Draw(img)
-    img.paste((255, 255, 255), (0, 0, width, height))
-
-    x_pos = int(width * 0.05)
-    y_baseline = height // 2
-    
-    for char in text:
-        font_path = random.choice(fonts) if fonts else None
-        font_size = int(height * random.uniform(0.7, 0.8))
-        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
-        
-        rotation = random.uniform(-25, 25)
-        char_w, char_h = font.getbbox(char)[2], font.getbbox(char)[3]
-        
-        char_img = Image.new('RGBA', (char_w, char_h), (0, 0, 0, 0))
-        char_draw = ImageDraw.Draw(char_img)
-        char_draw.text((0, 0), char, font=font, fill=(0, 0, 0))
-        
-        rotated_char = char_img.rotate(rotation, expand=1, resample=Image.BILINEAR)
-        
-        # Zigzag baseline
-        y_pos = y_baseline - rotated_char.height // 2 + random.randint(-height//6, height//6)
-        img.paste(rotated_char, (x_pos, y_pos), rotated_char)
-        
-        x_pos += rotated_char.width - int(font_size * 0.1)
-
-    # Add medium noise
-    arr = np.array(img).astype(np.float32)
-    noise = np.random.normal(0, 15, arr.shape)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    
-    return Image.fromarray(arr)
+    text_width = font.getlength(text)
+    x_start = (width - text_width) / 2
+    y_start = (height - font.getbbox(text)[3]) / 2
+    draw.text((x_start, y_start), text, font=font, fill=(0, 0, 0))
+    return img
 
 
 def _style_artistic_calligraphy(base_img, text, width, height, fonts):
@@ -633,28 +663,38 @@ def _style_artistic_calligraphy(base_img, text, width, height, fonts):
 
 
 def _style_motion_blur_text(base_img, text, width, height, fonts):
-    """Style 18: Applies horizontal or vertical motion blur."""
-    img = base_img.copy()
-    draw = ImageDraw.Draw(img)
-    img.paste((255, 255, 255), (0, 0, width, height))
+    """Style 18: Applies motion blur while keeping the captcha readable."""
+    max_attempts = 3
+    radius = random.uniform(3, 5)
+    angle_options = [0, random.uniform(-12, 12)]
 
-    font_path = random.choice(fonts) if fonts else None
-    font_size = int(height * 0.8)
-    font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
+    for attempt in range(max_attempts):
+        img = base_img.copy()
+        draw = ImageDraw.Draw(img)
+        img.paste((255, 255, 255), (0, 0, width, height))
 
-    x_pos = int(width * 0.1)
-    for i, char in enumerate(text):
-        # Each letter shifted differently
-        offset = i * random.uniform(-2, 2)
-        draw.text((x_pos + offset, (height - font.getbbox(char)[3]) / 2), char, font=font, fill=(0, 0, 0))
-        x_pos += font.getlength(char)
+        font_path = random.choice(fonts) if fonts else None
+        font_size = int(height * 0.82)
+        font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
 
-    # Apply motion blur
-    angle = random.choice([0, 90]) # Horizontal or vertical
-    radius = random.uniform(3, 6)
-    img = _motion_blur(img, radius=radius, angle=angle)
-    
-    return img
+        x_pos = int(width * 0.08)
+        for i, char in enumerate(text):
+            offset = i * random.uniform(-1.5, 1.5)
+            draw.text((x_pos + offset, (height - font.getbbox(char)[3]) / 2), char, font=font, fill=(0, 0, 0))
+            x_pos += max(font.getlength(char) * 0.95, 1.0)
+
+        angle = random.choice(angle_options)
+        blurred = _motion_blur(img, radius=radius, angle=angle)
+
+        stat = ImageStat.Stat(blurred.convert('L'))
+        stddev = stat.stddev[0] if stat.stddev else 0.0
+        if stddev >= 12.0 or attempt == max_attempts - 1:
+            if stddev < 12.0:
+                blurred = ImageEnhance.Contrast(blurred).enhance(1.4)
+            return blurred
+
+        radius = max(1.5, radius * 0.7)
+        angle_options = [0.0]  # fall back to horizontal blur only on next attempt
 
 
 def _style_double_exposure(base_img, text, width, height, fonts):
@@ -934,29 +974,48 @@ def _style_cartoon_comic(base_img, text, width, height, fonts):
 
 
 def _style_broken_pixels(base_img, text, width, height, fonts):
-    """Style 17: Simulates low-quality compression and pixel dropout."""
+    """Style 17: Simulate characters with chipped edges and missing segments."""
     img = base_img.copy()
     draw = ImageDraw.Draw(img)
     img.paste((255, 255, 255), (0, 0, width, height))
 
     font_path = random.choice(fonts) if fonts else None
-    font_size = int(height * 0.8)
+    font_size = int(height * 0.78)
     font = ImageFont.truetype(font_path, font_size) if font_path else ImageFont.load_default()
     text_width = font.getlength(text)
     x_start = (width - text_width) / 2
     y_start = (height - font.getbbox(text)[3]) / 2
     draw.text((x_start, y_start), text, font=font, fill=(0, 0, 0))
 
-    # Simulate blocky compression by downscaling and upscaling
-    small_size = (width // 8, height // 8)
-    img = img.resize(small_size, Image.NEAREST).resize((width, height), Image.NEAREST)
+    # Apply coarse pixelation
+    factor = random.randint(6, 9)
+    small = (max(6, width // factor), max(6, height // factor))
+    pixelated = img.resize(small, Image.NEAREST).resize((width, height), Image.NEAREST)
+    arr = np.array(pixelated)
 
-    # Pixel dropout
-    arr = np.array(img)
-    dropout_mask = np.random.rand(height, width) > 0.95
-    arr[dropout_mask] = [255, 255, 255] # Drop pixels to white
-    
-    return Image.fromarray(arr)
+    # Remove random slivers to break strokes
+    num_cuts = random.randint(6, 10)
+    for _ in range(num_cuts):
+        cut_w = random.randint(max(1, width // 30), max(2, width // 12))
+        cut_h = random.randint(1, max(2, height // 6))
+        x0 = random.randint(0, max(0, width - cut_w))
+        y0 = random.randint(0, max(0, height - cut_h))
+        arr[y0:y0 + cut_h, x0:x0 + cut_w] = 255
+
+    # Add small dropout speckles
+    dropout_mask = np.random.rand(height, width) > random.uniform(0.93, 0.96)
+    arr[dropout_mask] = 255
+
+    noisy = arr.astype(np.int16)
+    noise = np.random.randint(-20, 21, arr.shape)
+    noisy = np.clip(noisy + noise, 0, 255).astype(np.uint8)
+    result = Image.fromarray(noisy)
+
+    stat = ImageStat.Stat(result.convert('L'))
+    if stat.stddev and stat.stddev[0] < 18:
+        # If it still ended up too flat, boost contrast a bit.
+        result = ImageEnhance.Contrast(result).enhance(1.35)
+    return result
 
 
 # A dictionary to map styles to their functions
