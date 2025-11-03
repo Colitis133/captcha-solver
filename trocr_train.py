@@ -43,6 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bf16", action="store_true", help="Use BF16 training if supported")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to a Trainer checkpoint to resume from")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--freeze-encoder",
+        action="store_true",
+        help="Freeze the vision encoder (useful when only decoder fine-tuning is desired).",
+    )
+    parser.add_argument(
+        "--freeze-decoder",
+        action="store_true",
+        help="Freeze the text decoder (useful for encoder-only adaptation).",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +103,18 @@ def main() -> None:
     processor = TrOCRProcessor.from_pretrained(args.pretrained)
     model = VisionEncoderDecoderModel.from_pretrained(args.pretrained)
     setup_regeneration_settings(model, processor, args)
+
+    if args.freeze_encoder:
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        print("Encoder parameters frozen (requires_grad=False).")
+    if args.freeze_decoder:
+        for param in model.decoder.parameters():
+            param.requires_grad = False
+        print("Decoder parameters frozen (requires_grad=False).")
+
+    if not any(param.requires_grad for param in model.parameters()):
+        raise ValueError("All model parameters are frozen. Disable at least one freeze flag to train.")
 
     train_dataset, eval_dataset = build_datasets(processor, args)
 

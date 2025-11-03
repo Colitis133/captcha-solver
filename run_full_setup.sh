@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Create venv, install deps, generate dataset, and build ddddocr manifests.
+# Create venv, install deps, generate dataset, and build TrOCR manifests.
 ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT_DIR"
 
@@ -13,7 +13,7 @@ pip install -r requirements.txt
 # Generate synthetic dataset (2,000 train / 500 val by default)
 python generate_dataset.py --out data
 
-# Build tab-separated manifests for ddddocr tooling
+# Build tab-separated manifests for TrOCR fine-tuning
 python build_annotations.py --data-root data --out-dir annotations
 
 echo "Done"

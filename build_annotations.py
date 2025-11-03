@@ -2,10 +2,12 @@
 """Generate tab-separated annotation files from the dataset folders."""
 
 import argparse
+import re
 from pathlib import Path
 from typing import Iterable, Tuple
 
-from captcha_solver.dataset import FILENAME_LABEL_RE
+
+FILENAME_LABEL_RE = re.compile(r"([A-Za-z0-9]+)_.*\.(?:png|jpg|jpeg)$")
 
 
 def collect_images(split_dir: Path) -> Iterable[Tuple[str, str]]:

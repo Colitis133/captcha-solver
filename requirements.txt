@@ -1,10 +1,9 @@
-numpy
-Pillow
 torch
 torchvision
-tqdm
-ddddocr
+numpy
+Pillow
 opencv-python-headless
+tqdm
 transformers
 datasets
 accelerate

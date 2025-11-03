@@ -72,3 +72,9 @@ class TrOCRManifestDataset(Dataset):
             sample["path"] = str(img_path)
             sample["label_text"] = label
         return sample
+
+
+# Backwards compatibility alias for older imports.
+CaptchaManifestDataset = TrOCRManifestDataset
+
+__all__ = ["TrOCRManifestDataset", "CaptchaManifestDataset"]
