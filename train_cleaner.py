@@ -91,7 +91,7 @@ def main() -> None:
     model = CleanerUNet().to(device)
     criterion = nn.L1Loss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     best_val = float("inf")
@@ -140,7 +140,11 @@ def main() -> None:
 
         val_loss /= len(val_ds)
         val_psnr /= len(val_ds)
+        old_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < old_lr:
+            print(f"Validation plateau detected, reducing LR from {old_lr:.6f} to {new_lr:.6f}")
 
         history.append(Metrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss, val_psnr=val_psnr))
 
