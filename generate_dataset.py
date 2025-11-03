@@ -1,34 +1,40 @@
-"""Prepare the synthetic CAPTCHA dataset split for training and validation.
+"""Prepare paired noisy/clean CAPTCHA datasets for the cleaner + OCR pipeline.
 
-The spec requires 2,500 total images:
-* Training: 2,000 images, balanced across styles 1-20 (100 samples each).
-* Validation: 500 images, all "Mutant Hybrid" (style 21) to measure generalisation.
+The generator now writes **aligned pairs** for every sample:
 
-This module only wires the logic. Run the script manually once satisfied with the
-visual output of each style. Pass `--dry-run` to preview the plan without writing
-any files.
+* train/noisy/<style>/<label>__...png – heavy augmentations (20 styles).
+* train/clean/<style>/<label>__...png – canonical single-font rendering.
+* val/noisy and val/clean – Mutant Hybrid only for held-out validation.
+
+This paired layout feeds the U-Net cleaner first; the cleaned images later drive
+TrOCR fine-tuning. Pass `--dry-run` to preview counts without writing files.
 """
 
 import argparse
 import os
 from typing import Dict
 
-from captcha_solver.generate_synthetic import gen_captcha, CaptchaStyle
+from captcha_solver.generate_synthetic import gen_captcha, CaptchaStyle, render_clean_captcha
 
 
 def _ensure_split_dirs(out_dir: str) -> Dict[str, str]:
     os.makedirs(out_dir, exist_ok=True)
-    train_dir = os.path.join(out_dir, 'train')
-    val_dir = os.path.join(out_dir, 'val')
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(val_dir, exist_ok=True)
-    return {'train': train_dir, 'val': val_dir}
+    paths = {}
+    for split in ("train", "val"):
+        split_root = os.path.join(out_dir, split)
+        for kind in ("noisy", "clean"):
+            os.makedirs(os.path.join(split_root, kind), exist_ok=True)
+        paths[split] = split_root
+    return paths
 
 
-def _style_subdir(root: str, style: CaptchaStyle) -> str:
-    style_dir = os.path.join(root, style.name.lower())
-    os.makedirs(style_dir, exist_ok=True)
-    return style_dir
+def _style_subdirs(split_root: str, style: CaptchaStyle) -> Dict[str, str]:
+    style_name = style.name.lower()
+    noisy_dir = os.path.join(split_root, "noisy", style_name)
+    clean_dir = os.path.join(split_root, "clean", style_name)
+    os.makedirs(noisy_dir, exist_ok=True)
+    os.makedirs(clean_dir, exist_ok=True)
+    return {"noisy": noisy_dir, "clean": clean_dir}
 
 
 def _sanitize_label(label: str) -> str:
@@ -67,22 +73,28 @@ def generate(out_dir: str = 'data', train_per_style: int = 100, val_total: int =
 
     dirs = _ensure_split_dirs(out_dir)
 
-    print("\nGenerating training split...")
+    print("\nGenerating training split (paired noisy ↔ clean images)...")
     for style in train_styles:
-        style_dir = _style_subdir(dirs['train'], style)
+        style_dirs = _style_subdirs(dirs['train'], style)
         for idx in range(train_per_style):
             img, label = gen_captcha(style=style)
             safe_label = _sanitize_label(label)
+            width, height = img.size
+            clean_img = render_clean_captcha(label, width=width, height=height)
             fname = f"{safe_label}__{style.name.lower()}_{idx:04d}.png"
-            img.save(os.path.join(style_dir, fname))
+            img.save(os.path.join(style_dirs['noisy'], fname))
+            clean_img.save(os.path.join(style_dirs['clean'], fname))
 
     print("Generating validation split (Mutant Hybrid)...")
-    val_dir = _style_subdir(dirs['val'], val_style)
+    val_dirs = _style_subdirs(dirs['val'], val_style)
     for idx in range(val_total):
         img, label = gen_captcha(style=val_style)
         safe_label = _sanitize_label(label)
+        width, height = img.size
+        clean_img = render_clean_captcha(label, width=width, height=height)
         fname = f"{safe_label}__{val_style.name.lower()}_{idx:04d}.png"
-        img.save(os.path.join(val_dir, fname))
+        img.save(os.path.join(val_dirs['noisy'], fname))
+        clean_img.save(os.path.join(val_dirs['clean'], fname))
 
     print("\nCompleted dataset generation.")
     print(f"  Training images: {planned['train']}")

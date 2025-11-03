@@ -23,6 +23,17 @@ from functools import lru_cache
 
 DEFAULT_CHARS = string.ascii_uppercase + string.digits
 
+# Canonical clean-captcha rendering uses a deterministic sans-serif font so the
+# U-Net target stays stable across operating systems. We try a short list of
+# fonts that are commonly available on Linux containers, then fall back to the
+# bundled Pillow default as a last resort.
+CANONICAL_FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "fonts/Arial.ttf",
+    "fonts/arial.ttf",
+)
+
 
 class CaptchaStyle(enum.Enum):
     """Enum to define the 20 different CAPTCHA styles."""
@@ -73,6 +84,23 @@ def _find_local_fonts(dirpath="fonts"):
         except OSError:
             print(f"Warning: Skipping unsupported font file '{path}'.")
     return valid_fonts
+
+
+@lru_cache(maxsize=32)
+def _load_canonical_font(size: int) -> ImageFont.FreeTypeFont:
+    for candidate in CANONICAL_FONT_CANDIDATES:
+        if not candidate:
+            continue
+        if not os.path.exists(candidate):
+            continue
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except OSError:
+        return ImageFont.load_default()
 
 
 def _add_textured_background(img, intensity=0.12):
@@ -1088,6 +1116,25 @@ def gen_captcha(text=None, width=160, height=60, fonts=None, style=None):
     # but it's better to keep them within the style functions for uniqueness.
 
     return img, text
+
+
+def render_clean_captcha(text: str, width: int = 160, height: int = 60, *, font_scale: float = 0.72) -> Image.Image:
+    """Render a noise-free, single-font target image for cleaner supervision."""
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    font_size = max(18, int(height * font_scale))
+    font = _load_canonical_font(font_size)
+
+    text_width = font.getlength(text)
+    bbox = font.getbbox(text)
+    text_height = bbox[3] - bbox[1]
+
+    x = max(0, int((width - text_width) // 2))
+    y = max(0, int((height - text_height) // 2) - bbox[1])
+
+    draw.text((x, y), text, font=font, fill=(0, 0, 0))
+    return canvas
 
 
 if __name__ == "__main__":

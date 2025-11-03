@@ -1,3 +1,4 @@
+
 """Datasets for TrOCR fine-tuning and evaluation."""
 from __future__ import annotations
 
@@ -25,8 +26,11 @@ class TrOCRManifestDataset(Dataset):
             raise FileNotFoundError(f"Manifest not found: {self.manifest_path}")
 
         if image_root is None:
-            # Assume manifest lives in annotations/ and paths are relative to repo root.
-            image_root = self.manifest_path.parent.parent
+            candidate = self.manifest_path.parent.parent / "data"
+            if candidate.exists():
+                image_root = candidate
+            else:
+                image_root = self.manifest_path.parent.parent
         self.image_root = Path(image_root)
 
         self.processor = processor

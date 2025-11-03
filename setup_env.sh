@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lightweight, idempotent environment setup for the TrOCR-based CAPTCHA solver.
+# Environment bootstrap for the cleaner + TrOCR pipeline.
 # Usage:
-#   ./setup_env.sh                 # create venv, install deps, generate data, build manifests
+#   ./setup_env.sh                 # create venv, install deps, generate paired data, build manifests
 #   ./setup_env.sh --no-data       # skip dataset generation
 #   ./setup_env.sh --no-manifests  # skip TSV manifest creation
 
@@ -50,14 +50,14 @@ else
 fi
 
 if $DO_DATA; then
-  echo "Generating synthetic dataset (default 2000 train / 500 val images under ./data)..."
+  echo "Generating paired synthetic dataset under ./data (noisy + clean)..."
   $PY generate_dataset.py --out data
 else
   echo "Skipping dataset generation (--no-data)"
 fi
 
 if $DO_MANIFESTS; then
-  echo "Building TSV manifests under ./annotations..."
+  echo "Building cleaner and OCR manifests under ./annotations..."
   $PY build_annotations.py --data-root data --out-dir annotations
 else
   echo "Skipping manifest generation (--no-manifests)"
