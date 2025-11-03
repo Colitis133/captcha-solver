@@ -34,3 +34,4 @@ checkpoints/
 
 # Mac
 .DS_Store
+data/
