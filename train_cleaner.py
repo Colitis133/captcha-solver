@@ -36,14 +36,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-manifest", type=Path, default=Path("annotations/cleaner_val.tsv"))
     parser.add_argument("--image-root", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/cleaner"))
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--patience", type=int, default=10, help="Stop if val loss does not improve for this many epochs.")
+    parser.add_argument("--patience", type=int, default=20, help="Stop if val loss does not improve for this many epochs.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to a checkpoint (.pt) to resume from (e.g. outputs/cleaner/best_cleaner.pt).",
+    )
+    parser.add_argument(
+        "--resume-optimizer",
+        action="store_true",
+        help="Restore optimizer/scheduler/scaler states when resuming (defaults to model only).",
+    )
     return parser.parse_args()
 
 
@@ -64,6 +75,17 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
+
+    try:
+        from torch.amp import autocast as amp_autocast, GradScaler as AmpGradScaler  # type: ignore
+
+        autocast_ctx = amp_autocast
+        grad_scaler_cls = AmpGradScaler
+        autocast_kwargs = {"device_type": device.type}
+    except (ImportError, AttributeError):
+        autocast_ctx = torch.cuda.amp.autocast  # type: ignore[attr-defined]
+        grad_scaler_cls = torch.cuda.amp.GradScaler  # type: ignore[attr-defined]
+        autocast_kwargs = {}
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,13 +114,41 @@ def main() -> None:
     criterion = nn.L1Loss()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = grad_scaler_cls(enabled=amp_enabled)
 
     best_val = float("inf")
     best_epoch = 0
     history: List[Metrics] = []
+    start_epoch = 0
+    metrics_path = args.output_dir / "history.json"
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume_checkpoint:
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state"])
+        if args.resume_optimizer and "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            if "scheduler_state" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+            if "scaler_state" in checkpoint:
+                try:
+                    scaler.load_state_dict(checkpoint["scaler_state"])
+                except Exception:
+                    pass
+        best_val = checkpoint.get("val_loss", best_val)
+        best_epoch = checkpoint.get("best_epoch", checkpoint.get("epoch", 0))
+        start_epoch = checkpoint.get("epoch", 0)
+        print(
+            f"Loaded checkpoint {args.resume_checkpoint} (epoch {start_epoch}, best epoch {best_epoch}, best val {best_val:.4f})"
+        )
+        if metrics_path.exists():
+            try:
+                with metrics_path.open("r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                history = [Metrics(**item) for item in existing]
+            except Exception:
+                history = []
+
+    for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         train_loss = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
@@ -107,7 +157,7 @@ def main() -> None:
             clean = clean.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                 pred = model(noisy)
                 loss = criterion(pred, clean)
 
@@ -131,7 +181,7 @@ def main() -> None:
             for noisy, clean, _ in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False):
                 noisy = noisy.to(device, non_blocking=True)
                 clean = clean.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                     pred = model(noisy)
                     loss = criterion(pred, clean)
                     mse = torch.mean((pred - clean) ** 2, dim=(1, 2, 3))
@@ -152,16 +202,24 @@ def main() -> None:
         if improved:
             best_val = val_loss
             best_epoch = epoch
-            torch.save({
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_psnr": val_psnr,
-            }, args.output_dir / "best_cleaner.pt")
+
+        checkpoint_payload = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(),
+            "scaler_state": scaler.state_dict() if amp_enabled else None,
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "val_psnr": val_psnr,
+            "best_epoch": best_epoch,
+        }
+
+        if improved:
+            torch.save(checkpoint_payload, args.output_dir / "best_cleaner.pt")
+
+        torch.save(checkpoint_payload, args.output_dir / "last_cleaner.pt")
 
         # Persist training history incrementally
-        metrics_path = args.output_dir / "history.json"
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump([asdict(m) for m in history], f, indent=2)
 
@@ -189,6 +247,7 @@ def main() -> None:
             "patience": args.patience,
             "seed": args.seed,
             "amp": amp_enabled,
+            "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
             "best_epoch": best_epoch,
             "best_val_loss": best_val,
         }, f, indent=2)

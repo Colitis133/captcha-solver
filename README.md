@@ -66,14 +66,29 @@ python train_cleaner.py \
 	--val-manifest annotations/cleaner_val.tsv \
 	--image-root data \
 	--output-dir outputs/cleaner \
-	--epochs 60 \
-	--batch-size 16
+	--epochs 100 \
+	--patience 20
 ```
 
 During training the script reports training loss, validation loss, and PSNR. It
 keeps the best checkpoint (`outputs/cleaner/best_cleaner.pt`) and records the
-full history in `outputs/cleaner/history.json`. Early stopping kicks in after 10
+full history in `outputs/cleaner/history.json`. Early stopping kicks in after 20
 epochs without improvement—no manual intervention needed.
+
+Resume training later by pointing to the previous best (or last) checkpoint:
+
+```bash
+python train_cleaner.py \
+	--train-manifest annotations/cleaner_train.tsv \
+	--val-manifest annotations/cleaner_val.tsv \
+	--image-root data \
+	--output-dir outputs/cleaner \
+	--resume-checkpoint outputs/cleaner/best_cleaner.pt \
+	--resume-optimizer
+```
+
+Every epoch also updates `outputs/cleaner/last_cleaner.pt`, which you can use for
+checkpoints mid-training.
 
 ### Cleaner Architecture Highlights
 
