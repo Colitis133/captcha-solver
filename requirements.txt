@@ -5,3 +5,8 @@ torchvision
 tqdm
 ddddocr
 opencv-python-headless
+transformers
+datasets
+accelerate
+evaluate
+sentencepiece
