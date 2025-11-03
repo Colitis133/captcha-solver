@@ -8,11 +8,12 @@ import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
@@ -22,12 +23,86 @@ from captcha_solver.cleaner_dataset import CleanerDataset
 from captcha_solver.cleaner_model import CleanerUNet
 
 
+WINDOW_CACHE: Dict[tuple[int, float, int, str, torch.dtype], torch.Tensor] = {}
+
+
+def _get_gaussian_window(
+    window_size: int,
+    sigma: float,
+    channels: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = (window_size, sigma, channels, str(device), dtype)
+    window = WINDOW_CACHE.get(key)
+    if window is None:
+        coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+        gauss = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        gauss = gauss / gauss.sum()
+        kernel_2d = torch.outer(gauss, gauss)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        window = kernel_2d.expand(channels, 1, window_size, window_size).contiguous()
+        WINDOW_CACHE[key] = window
+    return window
+
+
+def structural_similarity(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    window_size: int = 11,
+    sigma: float = 1.5,
+    data_range: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    if x.ndim != 4 or y.ndim != 4:
+        raise ValueError("SSIM expects NCHW tensors")
+    if x.shape != y.shape:
+        raise ValueError("Input tensors must have the same shape for SSIM computation")
+
+    _, channels, height, width = x.shape
+
+    effective_window = min(window_size, height, width)
+    if effective_window % 2 == 0:
+        effective_window -= 1
+    effective_window = max(effective_window, 1)
+
+    padding = effective_window // 2
+    window = _get_gaussian_window(
+        effective_window,
+        sigma,
+        channels,
+        x.device,
+        x.dtype,
+    )
+
+    mu_x = F.conv2d(x, window, padding=padding, groups=channels)
+    mu_y = F.conv2d(y, window, padding=padding, groups=channels)
+
+    mu_x_sq = mu_x * mu_x
+    mu_y_sq = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x_sq = F.conv2d(x * x, window, padding=padding, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y * y, window, padding=padding, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, window, padding=padding, groups=channels) - mu_xy
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    numerator = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
+    denominator = (mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2)
+    ssim_map = numerator / (denominator + eps)
+
+    return torch.clamp(ssim_map.mean(dim=(1, 2, 3)), min=-1.0, max=1.0)
+
+
 @dataclass
 class Metrics:
     epoch: int
     train_loss: float
     val_loss: float
     val_psnr: float
+    val_ssim: float | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,9 +116,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (requires workers > 0).")
+    parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory even when CUDA is available.")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=20, help="Stop if val loss does not improve for this many epochs.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--l1-weight", type=float, default=0.8, help="Weight for L1 loss component.")
+    parser.add_argument("--ssim-weight", type=float, default=0.2, help="Weight for SSIM structural component.")
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
@@ -76,6 +155,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
 
+    if args.l1_weight < 0 or args.ssim_weight < 0:
+        raise ValueError("Loss weights must be non-negative.")
+    if args.l1_weight + args.ssim_weight <= 0:
+        raise ValueError("At least one of L1 or SSIM weights must be positive.")
+    if args.prefetch_factor < 0:
+        raise ValueError("Prefetch factor must be non-negative.")
+    if args.num_workers > 0 and args.prefetch_factor != 0 and args.prefetch_factor < 2:
+        raise ValueError("Prefetch factor must be >= 2 when using worker processes.")
+
     try:
         from torch.amp import autocast as amp_autocast, GradScaler as AmpGradScaler  # type: ignore
 
@@ -92,22 +180,26 @@ def main() -> None:
     train_ds = CleanerDataset(args.train_manifest, args.image_root, augment=True)
     val_ds = CleanerDataset(args.val_manifest, args.image_root, augment=False)
 
+    pin_memory = False if args.no_pin_memory else device.type == "cuda"
+    common_loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": pin_memory,
+        "drop_last": False,
+    }
+    if args.num_workers > 0 and args.prefetch_factor > 0:
+        common_loader_kwargs["prefetch_factor"] = args.prefetch_factor
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
+        **common_loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
+        **common_loader_kwargs,
     )
 
     model = CleanerUNet().to(device)
@@ -159,7 +251,10 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                 pred = model(noisy)
-                loss = criterion(pred, clean)
+                l1_term = criterion(pred, clean)
+                ssim_scores = structural_similarity(pred, clean)
+                ssim_term = 1.0 - ssim_scores.mean()
+                loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
 
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -170,33 +265,42 @@ def main() -> None:
             scaler.update()
 
             train_loss += loss.item() * noisy.size(0)
-            progress.set_postfix({"loss": f"{loss.item():.4f}"})
+            progress.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "ssim": f"{ssim_scores.mean().detach().item():.3f}",
+            })
 
         train_loss /= len(train_ds)
 
         model.eval()
         val_loss = 0.0
         val_psnr = 0.0
+        val_ssim_total = 0.0
         with torch.no_grad():
             for noisy, clean, _ in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False):
                 noisy = noisy.to(device, non_blocking=True)
                 clean = clean.to(device, non_blocking=True)
                 with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                     pred = model(noisy)
-                    loss = criterion(pred, clean)
+                    l1_term = criterion(pred, clean)
+                    ssim_scores = structural_similarity(pred, clean)
+                    ssim_term = 1.0 - ssim_scores.mean()
+                    loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
                     mse = torch.mean((pred - clean) ** 2, dim=(1, 2, 3))
                 val_loss += loss.item() * noisy.size(0)
                 val_psnr += psnr(mse).sum().item()
+                val_ssim_total += ssim_scores.sum().item()
 
         val_loss /= len(val_ds)
         val_psnr /= len(val_ds)
+        val_ssim = val_ssim_total / len(val_ds)
         old_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]["lr"]
         if new_lr < old_lr:
             print(f"Validation plateau detected, reducing LR from {old_lr:.6f} to {new_lr:.6f}")
 
-        history.append(Metrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss, val_psnr=val_psnr))
+        history.append(Metrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss, val_psnr=val_psnr, val_ssim=val_ssim))
 
         improved = val_loss < best_val - 1e-5
         if improved:
@@ -211,6 +315,7 @@ def main() -> None:
             "epoch": epoch,
             "val_loss": val_loss,
             "val_psnr": val_psnr,
+            "val_ssim": val_ssim,
             "best_epoch": best_epoch,
         }
 
@@ -224,7 +329,7 @@ def main() -> None:
             json.dump([asdict(m) for m in history], f, indent=2)
 
         print(
-            f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | val PSNR {val_psnr:.2f} dB"
+            f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | val PSNR {val_psnr:.2f} dB | val SSIM {val_ssim:.3f}"
             + (" <-- best" if improved else "")
         )
 
@@ -243,10 +348,14 @@ def main() -> None:
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "num_workers": args.num_workers,
+            "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
+            "pin_memory": not args.no_pin_memory and device.type == "cuda",
             "grad_clip": args.grad_clip,
             "patience": args.patience,
             "seed": args.seed,
             "amp": amp_enabled,
+            "l1_weight": args.l1_weight,
+            "ssim_weight": args.ssim_weight,
             "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
             "best_epoch": best_epoch,
             "best_val_loss": best_val,

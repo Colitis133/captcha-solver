@@ -75,6 +75,12 @@ keeps the best checkpoint (`outputs/cleaner/best_cleaner.pt`) and records the
 full history in `outputs/cleaner/history.json`. Early stopping kicks in after 20
 epochs without improvement—no manual intervention needed.
 
+The loss defaults to a composite `0.8 * L1 + 0.2 * (1 - SSIM)` so the cleaner
+matches both pixel values and glyph structure. Tweak with `--l1-weight` and
+`--ssim-weight`, or set `--ssim-weight 0` to fall back to plain L1. To keep the
+GPU saturated, adjust `--batch-size`, `--prefetch-factor`, and `--num-workers`
+(defaults are tuned for Colab: batch 16, workers 2, prefetch 2).
+
 Resume training later by pointing to the previous best (or last) checkpoint:
 
 ```bash
@@ -119,3 +125,6 @@ checkpoints mid-training.
 	sample count; the cleaner needs diversity to generalise.
 - **Artifacts misaligned** – Re-run dataset generation so noisy/clean pairs are
 	re-created together. Each sample uses a shared filename to guarantee pairing.
+- **GPU under-utilisation** – bump `--batch-size`, `--prefetch-factor`, and
+  `--num-workers` (with `--pin-memory` default on) so the loader keeps the GPU
+  fed. Use `--no-pin-memory` if you hit host-memory constraints.
