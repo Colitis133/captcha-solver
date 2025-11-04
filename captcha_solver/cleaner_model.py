@@ -1,107 +1,130 @@
-"""U-Net style architecture for CAPTCHA cleaning."""
+"""ResNet-based U-Net (ResUNet) for CAPTCHA cleaning."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 
 
-class DoubleConv(nn.Module):
-    """(Conv → BN → ReLU) × 2 with optional dropout."""
+class _DoubleConv(nn.Module):
+    """Two stacked Conv-BN-ReLU layers."""
 
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0) -> None:
+    def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        layers = [
+        self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-        ]
-        if dropout > 0:
-            layers.insert(3, nn.Dropout2d(p=dropout))
-        self.double_conv = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.double_conv(x)
-
-
-class Down(nn.Module):
-    """Downscaling with max-pool followed by DoubleConv."""
-
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2, ceil_mode=True),
-            DoubleConv(in_channels, out_channels, dropout=dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.maxpool_conv(x)
+        return self.block(x)
 
 
-class Up(nn.Module):
-    """Upscaling then DoubleConv."""
+class _UpBlock(nn.Module):
+    """Upsample, fuse skip connection, and refine with convolutions."""
 
-    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0, bilinear: bool = True) -> None:
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
         super().__init__()
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, dropout=dropout)
-        else:
-            self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels, dropout=dropout)
+        self.upsample = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.conv = _DoubleConv(out_channels + skip_channels, out_channels)
 
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1 = self.up(x1)
-        diff_y = x2.size(2) - x1.size(2)
-        diff_x = x2.size(3) - x1.size(3)
-        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2])
-        x = torch.cat([x2, x1], dim=1)
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.upsample(x)
+        diff_y = skip.size(2) - x.size(2)
+        diff_x = skip.size(3) - x.size(3)
+        if diff_y != 0 or diff_x != 0:
+            x = F.pad(
+                x,
+                [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2],
+            )
+        x = torch.cat([skip, x], dim=1)
         return self.conv(x)
 
 
-class OutConv(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+class _ResNet34Encoder(nn.Module):
+    """ResNet-34 feature extractor used as the encoder trunk."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        return self.conv(x)
+    def __init__(self, in_channels: int = 3, pretrained: bool = False) -> None:
+        super().__init__()
+        weights = models.ResNet34_Weights.DEFAULT if pretrained else None
+        backbone = models.resnet34(weights=weights)
+
+        if in_channels != 3:
+            conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            if pretrained and backbone.conv1.weight.shape[1] == 3:
+                if in_channels == 1:
+                    with torch.no_grad():
+                        conv1.weight.copy_(backbone.conv1.weight.sum(dim=1, keepdim=True))
+                else:
+                    nn.init.kaiming_normal_(conv1.weight, mode="fan_out", nonlinearity="relu")
+            else:
+                nn.init.kaiming_normal_(conv1.weight, mode="fan_out", nonlinearity="relu")
+            backbone.conv1 = conv1
+
+        self.layer0 = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
+        self.maxpool = backbone.maxpool
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x0 = self.layer0(x)  # 1/2 resolution
+        x1 = self.layer1(self.maxpool(x0))  # 1/4 resolution
+        x2 = self.layer2(x1)  # 1/8
+        x3 = self.layer3(x2)  # 1/16
+        x4 = self.layer4(x3)  # 1/32
+        return x0, x1, x2, x3, x4
 
 
 class CleanerUNet(nn.Module):
-    """Moderate-depth U-Net tuned for 160×60 captchas."""
+    """ResUNet with a ResNet-34 encoder and lightweight decoder."""
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 3, base_channels: int = 64, dropout: float = 0.1) -> None:
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        *,
+        pretrained_encoder: bool = False,
+        freeze_encoder: bool = False,
+    ) -> None:
         super().__init__()
-        self.inc = DoubleConv(in_channels, base_channels, dropout=dropout)
-        self.down1 = Down(base_channels, base_channels * 2, dropout=dropout)
-        self.down2 = Down(base_channels * 2, base_channels * 4, dropout=dropout)
-        self.down3 = Down(base_channels * 4, base_channels * 8, dropout=dropout)
-        self.down4 = Down(base_channels * 8, base_channels * 8, dropout=dropout)
-        self.up1 = Up(base_channels * 16, base_channels * 4, dropout=dropout)
-        self.up2 = Up(base_channels * 8, base_channels * 2, dropout=dropout)
-        self.up3 = Up(base_channels * 4, base_channels, dropout=dropout)
-        self.up4 = Up(base_channels * 2, base_channels, dropout=dropout)
-        self.outc = OutConv(base_channels, out_channels)
+        self.encoder = _ResNet34Encoder(in_channels=in_channels, pretrained=pretrained_encoder)
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+        self.up4 = _UpBlock(512, 256, 256)
+        self.up3 = _UpBlock(256, 128, 128)
+        self.up2 = _UpBlock(128, 64, 64)
+        self.up1 = _UpBlock(64, 64, 64)
+        self.head = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, out_channels, kernel_size=1),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
+        x0, x1, x2, x3, x4 = self.encoder(x)
+        x = self.up4(x4, x3)
         x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        x = self.outc(x)
+        x = self.up2(x, x1)
+        x = self.up1(x, x0)
+        x = self.head(x)
         return torch.sigmoid(x)
 
 
-__all__ = [
-    "CleanerUNet",
-]
+__all__ = ["CleanerUNet"]

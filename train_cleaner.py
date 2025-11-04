@@ -8,7 +8,7 @@ import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
@@ -18,6 +18,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+
+from torchvision import models
 
 from captcha_solver.cleaner_dataset import CleanerDataset
 from captcha_solver.cleaner_model import CleanerUNet
@@ -105,6 +107,52 @@ class Metrics:
     val_ssim: float | None = None
 
 
+class VGGPerceptualLoss(nn.Module):
+    """VGG16-based perceptual loss using ImageNet feature activations."""
+
+    def __init__(self, layers: Sequence[int] | None = None, resize_to: tuple[int, int] = (224, 224)) -> None:
+        super().__init__()
+        weights = models.VGG16_Weights.IMAGENET1K_FEATURES
+        vgg = models.vgg16(weights=weights).features
+
+        if layers is None:
+            # Default to relu1_2, relu2_2, relu3_3 blocks.
+            layers = (4, 9, 16)
+
+        slices: List[nn.Sequential] = []
+        start = 0
+        for idx in layers:
+            block = nn.Sequential(*[vgg[i] for i in range(start, idx)])
+            slices.append(block)
+            start = idx
+
+        self.blocks = nn.ModuleList(slices)
+        for block in self.blocks:
+            for param in block.parameters():
+                param.requires_grad = False
+
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+        self.resize_to = resize_to
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        x = (x.float() - self.mean) / self.std
+        y = (y.float() - self.mean) / self.std
+
+        if self.resize_to is not None:
+            x = F.interpolate(x, size=self.resize_to, mode="bilinear", align_corners=False)
+            y = F.interpolate(y, size=self.resize_to, mode="bilinear", align_corners=False)
+
+        loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss = loss + F.l1_loss(x, y)
+        return loss
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-manifest", type=Path, default=Path("annotations/cleaner_train.tsv"))
@@ -123,6 +171,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--l1-weight", type=float, default=0.8, help="Weight for L1 loss component.")
     parser.add_argument("--ssim-weight", type=float, default=0.2, help="Weight for SSIM structural component.")
+    parser.add_argument("--perceptual-weight", type=float, default=0.1, help="Weight for perceptual VGG16 loss component.")
+    parser.add_argument("--encoder-pretrained", action="store_true", help="Use ImageNet-pretrained weights for the ResNet34 encoder.")
+    parser.add_argument("--freeze-encoder", action="store_true", help="Freeze encoder weights during training.")
     parser.add_argument(
         "--resume-checkpoint",
         type=Path,
@@ -155,10 +206,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
 
-    if args.l1_weight < 0 or args.ssim_weight < 0:
+    if args.l1_weight < 0 or args.ssim_weight < 0 or args.perceptual_weight < 0:
         raise ValueError("Loss weights must be non-negative.")
-    if args.l1_weight + args.ssim_weight <= 0:
-        raise ValueError("At least one of L1 or SSIM weights must be positive.")
+    if args.l1_weight + args.ssim_weight + args.perceptual_weight <= 0:
+        raise ValueError("At least one loss component must carry positive weight.")
     if args.prefetch_factor < 0:
         raise ValueError("Prefetch factor must be non-negative.")
     if args.num_workers > 0 and args.prefetch_factor != 0 and args.prefetch_factor < 2:
@@ -202,8 +253,14 @@ def main() -> None:
         **common_loader_kwargs,
     )
 
-    model = CleanerUNet().to(device)
+    model = CleanerUNet(
+        pretrained_encoder=args.encoder_pretrained,
+        freeze_encoder=args.freeze_encoder,
+    ).to(device)
     criterion = nn.L1Loss()
+    perceptual_loss_fn = VGGPerceptualLoss().to(device) if args.perceptual_weight > 0 else None
+    if perceptual_loss_fn is not None:
+        perceptual_loss_fn.eval()
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     scaler = grad_scaler_cls(enabled=amp_enabled)
@@ -243,6 +300,7 @@ def main() -> None:
     for epoch in range(start_epoch + 1, args.epochs + 1):
         model.train()
         train_loss = 0.0
+        train_perc = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for noisy, clean, _ in progress:
             noisy = noisy.to(device, non_blocking=True)
@@ -256,6 +314,11 @@ def main() -> None:
                 ssim_term = 1.0 - ssim_scores.mean()
                 loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
 
+            perceptual_term = torch.tensor(0.0, device=device)
+            if perceptual_loss_fn is not None:
+                perceptual_term = perceptual_loss_fn(pred, clean)
+                loss = loss + args.perceptual_weight * perceptual_term
+
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -265,17 +328,26 @@ def main() -> None:
             scaler.update()
 
             train_loss += loss.item() * noisy.size(0)
-            progress.set_postfix({
+            if perceptual_loss_fn is not None:
+                train_perc += perceptual_term.detach().item() * noisy.size(0)
+
+            postfix = {
                 "loss": f"{loss.item():.4f}",
                 "ssim": f"{ssim_scores.mean().detach().item():.3f}",
-            })
+            }
+            if perceptual_loss_fn is not None:
+                postfix["perc"] = f"{perceptual_term.detach().item():.4f}"
+            progress.set_postfix(postfix)
 
         train_loss /= len(train_ds)
+        if perceptual_loss_fn is not None:
+            train_perc /= len(train_ds)
 
         model.eval()
         val_loss = 0.0
         val_psnr = 0.0
         val_ssim_total = 0.0
+        val_perc_total = 0.0
         with torch.no_grad():
             for noisy, clean, _ in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False):
                 noisy = noisy.to(device, non_blocking=True)
@@ -287,6 +359,10 @@ def main() -> None:
                     ssim_term = 1.0 - ssim_scores.mean()
                     loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
                     mse = torch.mean((pred - clean) ** 2, dim=(1, 2, 3))
+                if perceptual_loss_fn is not None:
+                    perceptual_term = perceptual_loss_fn(pred, clean)
+                    loss = loss + args.perceptual_weight * perceptual_term
+                    val_perc_total += perceptual_term.detach().item() * noisy.size(0)
                 val_loss += loss.item() * noisy.size(0)
                 val_psnr += psnr(mse).sum().item()
                 val_ssim_total += ssim_scores.sum().item()
@@ -294,6 +370,7 @@ def main() -> None:
         val_loss /= len(val_ds)
         val_psnr /= len(val_ds)
         val_ssim = val_ssim_total / len(val_ds)
+        val_perc = val_perc_total / len(val_ds) if perceptual_loss_fn is not None else 0.0
         old_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
         new_lr = optimizer.param_groups[0]["lr"]
@@ -328,10 +405,14 @@ def main() -> None:
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump([asdict(m) for m in history], f, indent=2)
 
-        print(
+        message = (
             f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | val PSNR {val_psnr:.2f} dB | val SSIM {val_ssim:.3f}"
-            + (" <-- best" if improved else "")
         )
+        if perceptual_loss_fn is not None:
+            message += f" | train Perc {train_perc:.4f} | val Perc {val_perc:.4f}"
+        if improved:
+            message += " <-- best"
+        print(message)
 
         if epoch - best_epoch >= args.patience:
             print(f"Early stopping triggered (no improvement for {args.patience} epochs).")
@@ -356,6 +437,9 @@ def main() -> None:
             "amp": amp_enabled,
             "l1_weight": args.l1_weight,
             "ssim_weight": args.ssim_weight,
+            "perceptual_weight": args.perceptual_weight,
+            "encoder_pretrained": args.encoder_pretrained,
+            "freeze_encoder": args.freeze_encoder,
             "resume_checkpoint": str(args.resume_checkpoint) if args.resume_checkpoint else None,
             "best_epoch": best_epoch,
             "best_val_loss": best_val,

@@ -1,13 +1,13 @@
 """CAPTCHA tooling package."""
 
-from .generate_synthetic import gen_captcha, CaptchaStyle, render_clean_captcha
+from .trocr_dataset import TrOCRManifestDataset
 from .cleaner_dataset import CleanerDataset
 from .cleaner_model import CleanerUNet
+from .text_render import render_clean_label
 
 __all__ = [
-	"gen_captcha",
-	"CaptchaStyle",
-	"render_clean_captcha",
-	"CleanerDataset",
-	"CleanerUNet",
+    "TrOCRManifestDataset",
+    "CleanerDataset",
+    "CleanerUNet",
+    "render_clean_label",
 ]

@@ -1,15 +1,11 @@
 # CAPTCHA Cleaner + OCR Pipeline
 
-This project builds a two-stage CAPTCHA solver:
+A two-stage stack for solving real-world CAPTCHAs:
 
-1. **Cleaner** – a U-Net that removes noise, normalises fonts, and reconstructs
-	 broken characters.
-2. **OCR** – Microsoft’s TrOCR, which reads the cleaned images once the cleaner
-	 is trained.
+1. **Cleaner** – a ResNet34-based ResUNet that removes noise and normalises glyphs.
+2. **OCR** – Microsoft TrOCR fine-tuned on the cleaner outputs.
 
-The first milestone is training a rock-solid cleaner so TrOCR receives
-consistent inputs. Follow every step in order—skipping stages invites
-overfitting or brittle models.
+The current focus is producing the best possible cleaner so TrOCR receives crisp, consistent text.
 
 ## 1. Environment Setup
 
@@ -20,111 +16,93 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 2. Synthesize Paired Captchas
+## 2. Get the Kaggle Dataset
 
-Generate noisy/clean pairs for all 20 training styles plus the held-out
-validation style. To reach roughly 10 000 pairs (recommended for the cleaner),
-set `--train-per-style 500`:
+We rely entirely on the [Huge Captcha Dataset](https://www.kaggle.com/datasets/fournierp/huge-captcha-dataset). Download it into `data/real_captchas/` (see `run_full_setup.sh` for an automated flow). The archive already provides `train/`, `val/`, and `test/` splits with filenames encoding the ground-truth label (e.g. `abcdE.png`).
 
-```bash
-python generate_dataset.py --out data --train-per-style 500 --val-total 1000
-```
+Counts after download (full set):
 
-The script writes aligned images under:
+- `data/train`: ~157 k images
+- `data/val`: ~19.6 k images
+- `data/test`: ~19.6 k images
 
-- `data/train/noisy/<style>/LABEL__style_XXXX.png`
-- `data/train/clean/<style>/LABEL__style_XXXX.png`
-- `data/val/noisy/...`
-- `data/val/clean/...`
+## 3. Create Paired Training Targets
 
-The clean target is always rendered with the same sans-serif font so the U-Net
-has a stable goal.
-
-## 3. Build Manifests
-
-Create TSVs describing both training pairs and OCR-friendly targets:
+The cleaner expects paired noisy/clean images. Use `prepare_clean_pairs.py` to subset the Kaggle data and render canonical targets with a consistent font, white background, and the same dimensions as the source image.
 
 ```bash
-python build_annotations.py --data-root data --out-dir annotations
+python prepare_clean_pairs.py \
+  --source-root data \
+  --out-root data/paired \
+  --manifest-dir annotations \
+  --train-count 50000 \
+  --val-count 10000 \
+  --overwrite
 ```
 
-You will obtain:
+What this script does:
 
-- `annotations/cleaner_train.tsv` – `noisy_path<TAB>clean_path<TAB>label`
-- `annotations/cleaner_val.tsv`
-- `annotations/train.tsv` / `annotations/val.tsv` – clean images + labels for
-	later TrOCR fine-tuning
+- Copies the requested number of raw CAPTCHAs into `data/paired/<split>/inputs/`.
+- Re-renders each label (from the filename) with `render_clean_label`, producing a perfectly typeset target under `data/paired/<split>/targets/`.
+- Writes manifests `annotations/cleaner_{train,val}.tsv` in the format `inputs/path.png<TAB>targets/path.png<TAB>LABEL`.
+
+Adjust `--train-count`, `--val-count`, or add `--no-shuffle` / `--seed` to control sampling. Set `--overwrite` when regenerating pairs.
 
 ## 4. Train the Cleaner
 
-Launch the default training run (mixed precision on CUDA, early stopping, L1
-reconstruction loss):
+Launch training with the generated manifests:
 
 ```bash
 python train_cleaner.py \
-	--train-manifest annotations/cleaner_train.tsv \
-	--val-manifest annotations/cleaner_val.tsv \
-	--image-root data \
-	--output-dir outputs/cleaner \
-	--epochs 100 \
-	--patience 20
+  --train-manifest annotations/cleaner_train.tsv \
+  --val-manifest annotations/cleaner_val.tsv \
+  --image-root data/paired \
+  --output-dir outputs/cleaner \
+  --epochs 100 \
+  --patience 20 \
+  --encoder-pretrained \
+  --perceptual-weight 0.1
 ```
 
-During training the script reports training loss, validation loss, and PSNR. It
-keeps the best checkpoint (`outputs/cleaner/best_cleaner.pt`) and records the
-full history in `outputs/cleaner/history.json`. Early stopping kicks in after 20
-epochs without improvement—no manual intervention needed.
+Key details:
 
-The loss defaults to a composite `0.8 * L1 + 0.2 * (1 - SSIM)` so the cleaner
-matches both pixel values and glyph structure. Tweak with `--l1-weight` and
-`--ssim-weight`, or set `--ssim-weight 0` to fall back to plain L1. To keep the
-GPU saturated, adjust `--batch-size`, `--prefetch-factor`, and `--num-workers`
-(defaults are tuned for Colab: batch 16, workers 2, prefetch 2).
+- **Architecture** – ResUNet with a ResNet34 encoder (optionally ImageNet-initialised via `--encoder-pretrained`) and a lightweight decoder. Use `--freeze-encoder` if you want to fine-tune only the decoder head.
+- **Loss** – Composite `L = α·L1 + β·(1 - SSIM) + γ·L_perceptual`. The perceptual term leverages a frozen VGG16 feature extractor and focuses on structural fidelity rather than raw pixels.
+- **Mixed precision** – Enabled automatically when CUDA is available.
+- **Optimisation** – AdamW, ReduceLROnPlateau (patience 3), gradient clipping at 1.0, early stopping via `--patience`.
 
-Resume training later by pointing to the previous best (or last) checkpoint:
+Progress and checkpoints:
+
+- `outputs/cleaner/best_cleaner.pt` – best validation loss.
+- `outputs/cleaner/last_cleaner.pt` – latest epoch.
+- `outputs/cleaner/history.json` – per-epoch metrics (`train_loss`, `val_loss`, `val_psnr`, `val_ssim`, `train/val_perceptual` when enabled).
+
+Resume with:
 
 ```bash
 python train_cleaner.py \
-	--train-manifest annotations/cleaner_train.tsv \
-	--val-manifest annotations/cleaner_val.tsv \
-	--image-root data \
-	--output-dir outputs/cleaner \
-	--resume-checkpoint outputs/cleaner/best_cleaner.pt \
-	--resume-optimizer
+  --train-manifest annotations/cleaner_train.tsv \
+  --val-manifest annotations/cleaner_val.tsv \
+  --image-root data/paired \
+  --output-dir outputs/cleaner \
+  --resume-checkpoint outputs/cleaner/best_cleaner.pt \
+  --resume-optimizer
 ```
-
-Every epoch also updates `outputs/cleaner/last_cleaner.pt`, which you can use for
-checkpoints mid-training.
-
-### Cleaner Architecture Highlights
-
-- Moderate-depth U-Net with dropout and batch norm to fight overfitting
-- On-the-fly augmentations (blur, contrast, Gaussian noise, JPEG artifacts) on
-	the noisy input only
-- AdamW + ReduceLROnPlateau scheduler; gradient clipping at 1.0
 
 ## 5. Inspect Outputs
 
-- Load the checkpoint in a notebook and visualise predictions on
-	`data/val/noisy`. Expect crisp Arial-like text.
-- Check `history.json` to ensure validation loss tracks training loss closely;
-	divergence flags underfitting or data leakage.
+- Visualise predictions on held-out inputs from `data/paired/val/inputs/` to confirm the cleaner produces uniform, readable text.
+- Review `history.json` to ensure validation curves shadow training curves—large gaps flag overfitting or data leakage.
 
-## 6. Next Steps (After Cleaner Converges)
+## 6. Next Steps
 
-1. Generate cleaned datasets by running the trained U-Net across raw captchas.
-2. Fine-tune TrOCR on those cleaned images using the existing
-	 `trocr_train.py`/`trocr_eval.py` utilities.
-3. Export the end-to-end pipeline (`cleaner -> TrOCR`) for inference.
+1. Run the trained cleaner across the raw Kaggle splits (train/val/test) to generate cleaned inputs for OCR.
+2. Fine-tune TrOCR with `trocr_train.py` using the cleaned outputs and original labels.
+3. Evaluate end-to-end with `trocr_eval.py`; package the pipeline (`cleaner -> TrOCR`) for inference.
 
 ## Troubleshooting
 
-- **Cleaner overfits quickly** – Increase `--train-per-style`, keep augmentations
-	enabled (they are baked into the dataset class), and monitor PSNR.
-- **Validation loss stalls** – Ensure `generate_dataset.py` ran with the larger
-	sample count; the cleaner needs diversity to generalise.
-- **Artifacts misaligned** – Re-run dataset generation so noisy/clean pairs are
-	re-created together. Each sample uses a shared filename to guarantee pairing.
-- **GPU under-utilisation** – bump `--batch-size`, `--prefetch-factor`, and
-  `--num-workers` (with `--pin-memory` default on) so the loader keeps the GPU
-  fed. Use `--no-pin-memory` if you hit host-memory constraints.
+- **Perceptual loss downloads weights** – The first run pulls the VGG16 and ResNet34 weights from torchvision. Cache them locally if needed.
+- **Cleaner overfits** – Increase sample counts, keep data augmentations on (handled inside `CleanerDataset`), or freeze the encoder for early epochs.
+- **Validation stalls** – Ensure you actually generated the paired subset (check counts in `annotations/cleaner_*.tsv`) and optionally bump `--perceptual-weight` for more structural guidance.
+- **Data loader bottlenecks** – Tune `--batch-size`, `--num-workers`, `--prefetch-factor`, and `--no-pin-memory`. Defaults target mid-tier GPUs (batch 16, workers 2, prefetch 2).

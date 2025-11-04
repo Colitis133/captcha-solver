@@ -3,20 +3,24 @@ set -euo pipefail
 
 # Environment bootstrap for the cleaner + TrOCR pipeline.
 # Usage:
-#   ./setup_env.sh                 # create venv, install deps, generate paired data, build manifests
-#   ./setup_env.sh --no-data       # skip dataset generation
-#   ./setup_env.sh --no-manifests  # skip TSV manifest creation
+#   ./setup_env.sh                       # create venv, install deps, build paired dataset + manifests
+#   ./setup_env.sh --no-pairs            # skip paired dataset generation (just set up env)
+#   ./setup_env.sh --train-count 40000   # override default pair counts
+#   ./setup_env.sh --val-count 8000
+#   ./setup_env.sh --no-manifests        # alias for --no-pairs (backwards compatibility)
 
 ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT_DIR"
 
-DO_DATA=true
-DO_MANIFESTS=true
+DO_PAIRS=true
+TRAIN_COUNT=50000
+VAL_COUNT=10000
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --no-data) DO_DATA=false; shift ;;
-    --no-manifests) DO_MANIFESTS=false; shift ;;
+    --no-pairs|--no-manifests) DO_PAIRS=false; shift ;;
+    --train-count) TRAIN_COUNT="$2"; shift 2 ;;
+    --val-count) VAL_COUNT="$2"; shift 2 ;;
     -h|--help)
       sed -n '1,120p' "$0"
       exit 0
@@ -49,18 +53,21 @@ else
   exit 1
 fi
 
-if $DO_DATA; then
-  echo "Generating paired synthetic dataset under ./data (noisy + clean)..."
-  $PY generate_dataset.py --out data
+if $DO_PAIRS; then
+  if [[ ! -d data/train || ! -d data/val ]]; then
+    echo "Expected Kaggle dataset under ./data/train and ./data/val. Please extract it before running this script." >&2
+    exit 1
+  fi
+  echo "Preparing paired cleaner targets (train=$TRAIN_COUNT, val=$VAL_COUNT)..."
+  $PY prepare_clean_pairs.py \
+    --source-root data \
+    --out-root data/paired \
+    --manifest-dir annotations \
+    --train-count "$TRAIN_COUNT" \
+    --val-count "$VAL_COUNT" \
+    --overwrite
 else
-  echo "Skipping dataset generation (--no-data)"
-fi
-
-if $DO_MANIFESTS; then
-  echo "Building cleaner and OCR manifests under ./annotations..."
-  $PY build_annotations.py --data-root data --out-dir annotations
-else
-  echo "Skipping manifest generation (--no-manifests)"
+  echo "Skipping paired dataset generation (--no-pairs)"
 fi
 
 echo "Environment setup complete. Activate with: source $VENV_DIR/bin/activate"
