@@ -29,6 +29,11 @@ from captcha_solver.cleaner_model import CleanerUNet
 WINDOW_CACHE: Dict[tuple[int, float, int, str, torch.dtype], torch.Tensor] = {}
 
 
+def _assert_finite(tensor: torch.Tensor, name: str) -> None:
+    if not torch.isfinite(tensor).all():
+        raise ValueError(f"{name} contains non-finite values")
+
+
 def _get_gaussian_window(
     window_size: int,
     sigma: float,
@@ -168,6 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor (requires workers > 0).")
     parser.add_argument("--no-pin-memory", action="store_true", help="Disable pin_memory even when CUDA is available.")
+    parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision even when CUDA is available.")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=20, help="Stop if val loss does not improve for this many epochs.")
     parser.add_argument("--seed", type=int, default=42)
@@ -206,7 +212,7 @@ def main() -> None:
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = device.type == "cuda"
+    amp_enabled = device.type == "cuda" and not args.no_amp
 
     if args.l1_weight < 0 or args.ssim_weight < 0 or args.perceptual_weight < 0:
         raise ValueError("Loss weights must be non-negative.")
@@ -308,10 +314,13 @@ def main() -> None:
         for noisy, clean, _ in progress:
             noisy = noisy.to(device, non_blocking=True)
             clean = clean.to(device, non_blocking=True)
+            _assert_finite(noisy, "noisy inputs")
+            _assert_finite(clean, "clean targets")
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                 pred = model(noisy)
+                _assert_finite(pred, "model output")
                 l1_term = criterion(pred, clean)
                 ssim_scores = None
                 ssim_term = l1_term.new_tensor(0.0)
@@ -319,11 +328,14 @@ def main() -> None:
                     ssim_scores = structural_similarity(pred, clean)
                     ssim_term = 1.0 - ssim_scores.mean()
                 loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
+            _assert_finite(loss, "composite loss")
 
             perceptual_term = torch.tensor(0.0, device=device)
             if perceptual_loss_fn is not None:
                 perceptual_term = perceptual_loss_fn(pred, clean)
                 loss = loss + args.perceptual_weight * perceptual_term
+                _assert_finite(perceptual_term, "perceptual loss")
+                _assert_finite(loss, "composite loss with perceptual term")
 
             scaler.scale(loss).backward()
             if args.grad_clip > 0:
@@ -365,6 +377,7 @@ def main() -> None:
                 clean = clean.to(device, non_blocking=True)
                 with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                     pred = model(noisy)
+                    _assert_finite(pred, "model output (val)")
                     l1_term = criterion(pred, clean)
                     ssim_scores = None
                     ssim_term = l1_term.new_tensor(0.0)
@@ -373,10 +386,13 @@ def main() -> None:
                         ssim_term = 1.0 - ssim_scores.mean()
                     loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
                     mse = torch.mean((pred - clean) ** 2, dim=(1, 2, 3))
+                _assert_finite(loss, "validation loss")
                 if perceptual_loss_fn is not None:
                     perceptual_term = perceptual_loss_fn(pred, clean)
                     loss = loss + args.perceptual_weight * perceptual_term
                     val_perc_total += perceptual_term.detach().item() * noisy.size(0)
+                    _assert_finite(perceptual_term, "validation perceptual loss")
+                    _assert_finite(loss, "validation loss with perceptual term")
                 val_loss += loss.item() * noisy.size(0)
                 val_psnr += psnr(mse).sum().item()
                 if ssim_scores is not None:
