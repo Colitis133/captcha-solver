@@ -31,7 +31,17 @@ WINDOW_CACHE: Dict[tuple[int, float, int, str, torch.dtype], torch.Tensor] = {}
 
 def _assert_finite(tensor: torch.Tensor, name: str) -> None:
     if not torch.isfinite(tensor).all():
-        raise ValueError(f"{name} contains non-finite values")
+        total = tensor.numel()
+        nan_count = torch.isnan(tensor).sum().item()
+        posinf_count = torch.isposinf(tensor).sum().item()
+        neginf_count = torch.isneginf(tensor).sum().item()
+        finite = tensor.masked_select(torch.isfinite(tensor))
+        finite_min = finite.min().item() if finite.numel() else float("nan")
+        finite_max = finite.max().item() if finite.numel() else float("nan")
+        raise ValueError(
+            f"{name} contains non-finite values: total={total}, nan={nan_count}, +inf={posinf_count}, -inf={neginf_count}, "
+            f"finite_min={finite_min:.6f}, finite_max={finite_max:.6f}"
+        )
 
 
 def _get_gaussian_window(
@@ -265,6 +275,9 @@ def main() -> None:
         pretrained_encoder=args.encoder_pretrained,
         freeze_encoder=args.freeze_encoder,
     ).to(device)
+    for name, param in model.named_parameters():
+        if not torch.isfinite(param).all():
+            raise ValueError(f"Model parameter '{name}' initialised to non-finite values")
     criterion = nn.L1Loss()
     perceptual_loss_fn = VGGPerceptualLoss().to(device) if args.perceptual_weight > 0 else None
     if perceptual_loss_fn is not None:
