@@ -13,6 +13,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import functional as F
 
 
 @dataclass
@@ -30,10 +31,12 @@ class CleanerDataset(Dataset):
         manifest_path: Path,
         image_root: Path,
         augment: bool = True,
+        target_size: Tuple[int, int] | None = (256, 256),
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.image_root = Path(image_root)
         self.augment = augment
+        self.target_size = target_size
         self.samples = self._read_manifest(self.manifest_path)
         if not self.samples:
             raise ValueError(f"No samples found in manifest: {manifest_path}")
@@ -67,6 +70,10 @@ class CleanerDataset(Dataset):
 
         if self.augment:
             noisy = self._augment_noisy(noisy)
+
+        if self.target_size is not None:
+            noisy = F.resize(noisy, self.target_size, interpolation=Image.BILINEAR, antialias=True)
+            clean = F.resize(clean, self.target_size, interpolation=Image.BILINEAR, antialias=True)
 
         noisy_tensor = self.to_tensor(noisy)
         clean_tensor = self.to_tensor(clean)
