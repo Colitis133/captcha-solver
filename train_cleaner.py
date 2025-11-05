@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -94,6 +95,7 @@ def structural_similarity(
     numerator = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
     denominator = (mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2)
     ssim_map = numerator / (denominator + eps)
+    ssim_map = torch.nan_to_num(ssim_map, nan=1.0, posinf=1.0, neginf=-1.0)
 
     return torch.clamp(ssim_map.mean(dim=(1, 2, 3)), min=-1.0, max=1.0)
 
@@ -301,6 +303,7 @@ def main() -> None:
         model.train()
         train_loss = 0.0
         train_perc = 0.0
+        train_ssim = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for noisy, clean, _ in progress:
             noisy = noisy.to(device, non_blocking=True)
@@ -310,8 +313,11 @@ def main() -> None:
             with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                 pred = model(noisy)
                 l1_term = criterion(pred, clean)
-                ssim_scores = structural_similarity(pred, clean)
-                ssim_term = 1.0 - ssim_scores.mean()
+                ssim_scores = None
+                ssim_term = l1_term.new_tensor(0.0)
+                if args.ssim_weight > 0:
+                    ssim_scores = structural_similarity(pred, clean)
+                    ssim_term = 1.0 - ssim_scores.mean()
                 loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
 
             perceptual_term = torch.tensor(0.0, device=device)
@@ -330,11 +336,14 @@ def main() -> None:
             train_loss += loss.item() * noisy.size(0)
             if perceptual_loss_fn is not None:
                 train_perc += perceptual_term.detach().item() * noisy.size(0)
+            if ssim_scores is not None:
+                train_ssim += ssim_scores.mean().detach().item() * noisy.size(0)
 
             postfix = {
                 "loss": f"{loss.item():.4f}",
-                "ssim": f"{ssim_scores.mean().detach().item():.3f}",
             }
+            if ssim_scores is not None:
+                postfix["ssim"] = f"{ssim_scores.mean().detach().item():.3f}"
             if perceptual_loss_fn is not None:
                 postfix["perc"] = f"{perceptual_term.detach().item():.4f}"
             progress.set_postfix(postfix)
@@ -342,11 +351,13 @@ def main() -> None:
         train_loss /= len(train_ds)
         if perceptual_loss_fn is not None:
             train_perc /= len(train_ds)
+        train_ssim_avg = train_ssim / len(train_ds) if args.ssim_weight > 0 else float("nan")
 
         model.eval()
         val_loss = 0.0
         val_psnr = 0.0
         val_ssim_total = 0.0
+        val_ssim_count = 0
         val_perc_total = 0.0
         with torch.no_grad():
             for noisy, clean, _ in tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False):
@@ -355,8 +366,11 @@ def main() -> None:
                 with autocast_ctx(enabled=amp_enabled, **autocast_kwargs):
                     pred = model(noisy)
                     l1_term = criterion(pred, clean)
-                    ssim_scores = structural_similarity(pred, clean)
-                    ssim_term = 1.0 - ssim_scores.mean()
+                    ssim_scores = None
+                    ssim_term = l1_term.new_tensor(0.0)
+                    if args.ssim_weight > 0:
+                        ssim_scores = structural_similarity(pred, clean)
+                        ssim_term = 1.0 - ssim_scores.mean()
                     loss = args.l1_weight * l1_term + args.ssim_weight * ssim_term
                     mse = torch.mean((pred - clean) ** 2, dim=(1, 2, 3))
                 if perceptual_loss_fn is not None:
@@ -365,11 +379,13 @@ def main() -> None:
                     val_perc_total += perceptual_term.detach().item() * noisy.size(0)
                 val_loss += loss.item() * noisy.size(0)
                 val_psnr += psnr(mse).sum().item()
-                val_ssim_total += ssim_scores.sum().item()
+                if ssim_scores is not None:
+                    val_ssim_total += ssim_scores.sum().item()
+                    val_ssim_count += noisy.size(0)
 
         val_loss /= len(val_ds)
         val_psnr /= len(val_ds)
-        val_ssim = val_ssim_total / len(val_ds)
+        val_ssim = val_ssim_total / val_ssim_count if args.ssim_weight > 0 and val_ssim_count > 0 else float("nan")
         val_perc = val_perc_total / len(val_ds) if perceptual_loss_fn is not None else 0.0
         old_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
@@ -405,9 +421,11 @@ def main() -> None:
         with metrics_path.open("w", encoding="utf-8") as f:
             json.dump([asdict(m) for m in history], f, indent=2)
 
-        message = (
-            f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | val PSNR {val_psnr:.2f} dB | val SSIM {val_ssim:.3f}"
-        )
+        message = f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | val PSNR {val_psnr:.2f} dB"
+        if not math.isnan(train_ssim_avg):
+            message += f" | train SSIM {train_ssim_avg:.3f}"
+        if not math.isnan(val_ssim):
+            message += f" | val SSIM {val_ssim:.3f}"
         if perceptual_loss_fn is not None:
             message += f" | train Perc {train_perc:.4f} | val Perc {val_perc:.4f}"
         if improved:
