@@ -180,11 +180,13 @@ def ddp_main(rank, args):
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group(backend='nccl', rank=rank, world_size=torch.cuda.device_count())
     torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
     TPU_AVAILABLE = False
     main(args, rank=rank)
 
 def main(args, rank=None):
+    device = torch.device(f'cuda:{rank}') if rank is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    TPU_AVAILABLE = False
+    
     config = load_config(args.config)
 
     if args.azure_connection_string:
