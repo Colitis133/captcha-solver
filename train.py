@@ -22,6 +22,16 @@ from data import CaptchaDataset, collate_fn
 from utils import CTCDecoder, Metrics, setup_logger, load_config
 from backup_manager import BackupManager
 
+# Try to import TPU libraries
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    TPU_AVAILABLE = xm.xla_device_count() > 0
+except ImportError:
+    xm = None
+    pl = None
+    TPU_AVAILABLE = False
+
 #Define a custom learning rate scheduler with warmup.
 class WarmupScheduler:
     def __init__(self, optimizer, warmup_steps, main_scheduler):
@@ -54,7 +64,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
         
         optimizer.zero_grad(set_to_none=True)
         
-        with autocast(device_type='cuda', enabled=config['training']['mixed_precision']):
+        with autocast(device_type='xla' if TPU_AVAILABLE else 'cuda', enabled=config['training']['mixed_precision']):
             preds = model(images)
             log_probs = F.log_softmax(preds, dim=2)
             input_lengths = torch.full(size=(images.size(0),), fill_value=log_probs.size(1), dtype=torch.long, device=device)
@@ -65,11 +75,15 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
             print(f"Warning: Skipping batch {i} due to NaN/Inf loss.")
             continue
             
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
-        scaler.step(optimizer)
-        scaler.update()
+        if TPU_AVAILABLE:
+            loss.backward()
+            xm.optimizer_step(optimizer)
+        else:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+            scaler.step(optimizer)
+            scaler.update()
         scheduler.step()
         
         total_loss += loss.item()
@@ -101,7 +115,7 @@ def validate(model, dataloader, criterion, decoder, device, config, charset):
             labels_padded = labels_padded.to(device, non_blocking=True)
             label_lengths = label_lengths.to(device, non_blocking=True)
             
-            with autocast(device_type='cuda', enabled=config['training']['mixed_precision']):
+            with autocast(device_type='xla' if TPU_AVAILABLE else 'cuda', enabled=config['training']['mixed_precision']):
                 preds = model(images)
                 log_probs = F.log_softmax(preds, dim=2)
                 input_lengths = torch.full(size=(images.size(0),), fill_value=log_probs.size(1), dtype=torch.long, device=device)
@@ -199,7 +213,7 @@ def main(args):
                 azure_config=azure_cfg,
             )
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = xm.xla_device() if TPU_AVAILABLE else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     charset = config['data']['charset']
@@ -207,8 +221,8 @@ def main(args):
     train_dataset = CaptchaDataset(config['data']['train_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=True)
     val_dataset = CaptchaDataset(config['data']['val_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
+    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
 
     model = CRNN(
         vocab_size=len(charset), 
@@ -248,7 +262,7 @@ def main(args):
     
     scheduler = WarmupScheduler(optimizer, warmup_steps, main_scheduler)
     
-    scaler = torch.amp.GradScaler(enabled=config['training']['mixed_precision'])
+    scaler = torch.amp.GradScaler(enabled=config['training']['mixed_precision'] and not TPU_AVAILABLE)
     decoder = CTCDecoder(charset)
 
     #Initialize variables for training.
@@ -262,7 +276,7 @@ def main(args):
         if os.path.isfile(args.resume):
             resume_path = Path(args.resume).resolve()
             logger.info(f"Loading checkpoint '{resume_path}'")
-            checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
+            checkpoint = torch.load(resume_path, map_location='cpu', weights_only=True)
             start_epoch = checkpoint['epoch'] + 1
             best_val_acc = checkpoint.get('val_acc', 0)
             model.load_state_dict(checkpoint['model_state_dict'])
