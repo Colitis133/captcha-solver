@@ -170,20 +170,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best
     return os.path.abspath(checkpoint_path)
 
 
-# Multiprocessing entrypoint for TPUs must be a top-level function so it can be
-# pickled/imported by worker processes. Import torch_xla modules here to avoid
-# initializing XLA before spawn.
-def _mp_fn(index, args):
-    global device, TPU_AVAILABLE, pl, xm
-    # Set full TPU config before importing XLA to ensure all 8 cores are used
-    os.environ['XRT_TPU_CONFIG'] = 'localservice;0;localhost:51011,localhost:51012,localhost:51013,localhost:51014,localhost:51015,localhost:51016,localhost:51017,localhost:51018'
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
-    device = xm.xla_device()
-    TPU_AVAILABLE = True
-    # Now run the normal main routine in the child process
-    main(args)
-
 #Main training loop.
 def main(args):
     config = load_config(args.config)
@@ -241,8 +227,8 @@ def main(args):
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
 
     if TPU_AVAILABLE:
-        train_loader = pl.MpDeviceLoader(train_loader, device)
-        val_loader = pl.MpDeviceLoader(val_loader, device)
+        train_loader = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
+        val_loader = pl.ParallelLoader(val_loader, [device]).per_device_loader(device)
 
     model = CRNN(
         vocab_size=len(charset), 
@@ -379,7 +365,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if XLA_AVAILABLE:
-        xmp.spawn(_mp_fn, args=(args,), nprocs=None, start_method='spawn')
+        import torch_xla.core.xla_model as xm
+        import torch_xla.distributed.parallel_loader as pl
+        device = xm.xla_device()
+        TPU_AVAILABLE = True
+        main(args)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         TPU_AVAILABLE = False
