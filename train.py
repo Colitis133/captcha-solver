@@ -17,6 +17,9 @@ import json
 import numpy as np
 import math
 import re
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import re
 
 from model import CRNN
@@ -51,11 +54,11 @@ class WarmupScheduler:
             self.main_scheduler.step()
 
 #Train one epoch of the model.
-def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, config, scheduler, decoder, charset):
+def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, config, scheduler, decoder, charset, rank=None):
     model.train()
     total_loss = 0
     all_preds, all_targets = [], []
-    progress_bar = tqdm(dataloader, desc="Training")
+    progress_bar = tqdm(dataloader, desc="Training") if rank == 0 or rank is None else None
     
     for i, (images, labels_padded, label_lengths) in enumerate(progress_bar):
         images = images.to(device, non_blocking=True)
@@ -100,18 +103,20 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
             all_targets.extend(batch_targets[:3])
         
         if i % 10 == 0 or i == len(dataloader) - 1:
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
+            if progress_bar:
+                progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
         
     return total_loss / len(dataloader), all_preds, all_targets
 
 #Validate the model on the validation dataset.
-def validate(model, dataloader, criterion, decoder, device, config, charset):
+def validate(model, dataloader, criterion, decoder, device, config, charset, rank=None):
     model.eval()
     total_loss = 0
     all_preds, all_targets = [], []
     
     with torch.no_grad():
-        for images, labels_padded, label_lengths in tqdm(dataloader, desc="Validating"):
+        dataloader_iter = tqdm(dataloader, desc="Validating") if rank == 0 or rank is None else dataloader
+        for images, labels_padded, label_lengths in dataloader_iter:
             images = images.to(device, non_blocking=True)
             labels_padded = labels_padded.to(device, non_blocking=True)
             label_lengths = label_lengths.to(device, non_blocking=True)
@@ -170,7 +175,16 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best
 
 
 #Main training loop.
-def main(args):
+def ddp_main(rank, args):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group(backend='nccl', rank=rank, world_size=torch.cuda.device_count())
+    torch.cuda.set_device(rank)
+    device = torch.device(f'cuda:{rank}')
+    TPU_AVAILABLE = False
+    main(args, rank=rank)
+
+def main(args, rank=None):
     config = load_config(args.config)
 
     if args.azure_connection_string:
@@ -194,14 +208,18 @@ def main(args):
     os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
     os.makedirs(config['paths']['log_dir'], exist_ok=True)
 
-    logger = setup_logger(config['paths']['log_dir'])
+    if rank == 0 or rank is None:
+        logger = setup_logger(config['paths']['log_dir'])
+    else:
+        logger = None
 
     backup_cfg = config.get('backup', {}) or {}
     backup_manager = None
-    if backup_cfg.get('enabled'):
+    if backup_cfg.get('enabled') and (rank == 0 or rank is None):
         azure_cfg = backup_cfg.get('azure') or {}
         if not azure_cfg:
-            logger.warning("Backup enabled but no Azure configuration provided; disabling backups.")
+            if logger:
+                logger.warning("Backup enabled but no Azure configuration provided; disabling backups.")
         else:
             backup_manager = BackupManager(
                 base_dir=base_dir,
@@ -215,15 +233,22 @@ def main(args):
                 azure_config=azure_cfg,
             )
     
-    logger.info(f"Using device: {device}")
+    if logger:
+        logger.info(f"Using device: {device}")
 
     charset = config['data']['charset']
     
     train_dataset = CaptchaDataset(config['data']['train_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=True)
     val_dataset = CaptchaDataset(config['data']['val_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
+    if rank is not None:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=rank)
+        val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=rank)
+        train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], sampler=train_sampler, num_workers=8, collate_fn=collate_fn, pin_memory=True, prefetch_factor=4)
+        val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], sampler=val_sampler, num_workers=8, collate_fn=collate_fn, pin_memory=True, prefetch_factor=4)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=True, prefetch_factor=4)
+        val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=8, collate_fn=collate_fn, pin_memory=True, prefetch_factor=4)
 
     model = CRNN(
         vocab_size=len(charset), 
@@ -231,12 +256,18 @@ def main(args):
         attention_heads=config['model']['attention_heads'],
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout']
-    ).to(device)
+    )
     
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
+    if rank is not None:
+        model = model.to(device)
+        model = DDP(model, device_ids=[rank])
+    else:
+        model = model.to(device)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
     
-    logger.info(f"Model created. Total parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    if logger:
+        logger.info(f"Model created. Total parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     #Initialize the loss function.
     criterion = nn.CTCLoss(
@@ -276,10 +307,11 @@ def main(args):
     last_checkpoint_path = None
     
     #Load checkpoint if resuming training.
-    if args.resume:
+    if args.resume and (rank == 0 or rank is None):
         if os.path.isfile(args.resume):
             resume_path = Path(args.resume).resolve()
-            logger.info(f"Loading checkpoint '{resume_path}'")
+            if logger:
+                logger.info(f"Loading checkpoint '{resume_path}'")
             checkpoint = torch.load(resume_path, map_location='cpu', weights_only=True)
             start_epoch = checkpoint['epoch'] + 1
             best_val_acc = checkpoint.get('val_acc', 0)
@@ -287,10 +319,12 @@ def main(args):
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if 'scheduler_state_dict' in checkpoint and hasattr(scheduler, 'main_scheduler'):
                  scheduler.main_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            logger.info(f"Resuming from epoch {start_epoch}")
+            if logger:
+                logger.info(f"Resuming from epoch {start_epoch}")
             last_checkpoint_path = resume_path
         else:
-            logger.info(f"No checkpoint found at '{args.resume}', starting from scratch.")
+            if logger:
+                logger.info(f"No checkpoint found at '{args.resume}', starting from scratch.")
 
     #Start training loop.
     for epoch in range(start_epoch, config['training']['epochs']):
@@ -302,24 +336,26 @@ def main(args):
         epoch_duration = time.time() - start_time
         current_lr = optimizer.param_groups[0]['lr']
         
-        logger.info(f"Epoch {epoch+1}/{config['training']['epochs']} | Time: {epoch_duration:.1f}s | LR: {current_lr:.2e}")
-        logger.info(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        logger.info(f"Val CER: {val_cer:.4f} | Seq Acc: {val_seq_acc*100:.1f}% | Char Acc: {val_char_acc*100:.1f}%")
-        
-        if len(train_preds) > 0:
-            logger.info(f"Train Samples - Pred: {train_preds[:3]} | Target: {train_targets[:3]}")
-        if len(val_preds) > 0:
-            logger.info(f"Val Samples - Pred: {val_preds[:3]} | Target: {val_targets[:3]}")
+        if logger:
+            logger.info(f"Epoch {epoch+1}/{config['training']['epochs']} | Time: {epoch_duration:.1f}s | LR: {current_lr:.2e}")
+            logger.info(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            logger.info(f"Val CER: {val_cer:.4f} | Seq Acc: {val_seq_acc*100:.1f}% | Char Acc: {val_char_acc*100:.1f}%")
+            
+            if len(train_preds) > 0:
+                logger.info(f"Train Samples - Pred: {train_preds[:3]} | Target: {train_targets[:3]}")
+            if len(val_preds) > 0:
+                logger.info(f"Val Samples - Pred: {val_preds[:3]} | Target: {val_preds[:3]}")
 
         is_best = val_char_acc > best_val_acc
         if is_best:
             best_val_acc = val_char_acc
             patience_counter = 0
-            logger.info(f"* New best model saved with char accuracy: {val_char_acc*100:.2f}%")
+            if logger:
+                logger.info(f"* New best model saved with char accuracy: {val_char_acc*100:.2f}%")
         else:
             patience_counter += 1
             
-        if epoch % 10 == 0 or is_best:
+        if (epoch % 10 == 0 or is_best) and (rank == 0 or rank is None):
             last_checkpoint_path = Path(
                 save_checkpoint(
                 model,
@@ -332,15 +368,17 @@ def main(args):
                     previous_checkpoint=last_checkpoint_path,
                 )
             )
-        if backup_manager:
+        if backup_manager and (rank == 0 or rank is None):
             checkpoint_path_obj = last_checkpoint_path if last_checkpoint_path else None
             backup_manager.maybe_backup(epoch + 1, checkpoint_path_obj, best_model_path)
             
         if patience_counter >= config['validation']['early_stopping_patience']:
-            logger.info("Early stopping triggered.")
+            if logger:
+                logger.info("Early stopping triggered.")
             break
 
-    logger.info(f"Training completed. Best validation accuracy: {best_val_acc*100:.2f}%")
+    if logger:
+        logger.info(f"Training completed. Best validation accuracy: {best_val_acc*100:.2f}%")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Captcha Recognition Model")
@@ -362,6 +400,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    TPU_AVAILABLE = False
-    main(args)
+    if torch.cuda.device_count() > 1:
+        torch.multiprocessing.spawn(ddp_main, args=(args,), nprocs=torch.cuda.device_count())
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        TPU_AVAILABLE = False
+        main(args)
