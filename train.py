@@ -30,9 +30,6 @@ except ImportError:
     xmp = None
     XLA_AVAILABLE = False
 
-device = None
-TPU_AVAILABLE = False
-
 #Define a custom learning rate scheduler with warmup.
 class WarmupScheduler:
     def __init__(self, optimizer, warmup_steps, main_scheduler):
