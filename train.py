@@ -16,6 +16,7 @@ from tqdm import tqdm
 import json
 import numpy as np
 import math
+import sys
 
 from model import CRNN
 from data import CaptchaDataset, collate_fn
@@ -376,8 +377,84 @@ if __name__ == "__main__":
 
     if XLA_AVAILABLE:
         # Use the module-level `_mp_fn` so it can be imported by worker processes.
-        # Use nprocs=None to let PJRT choose the correct number of replicas (Kaggle TPU/PJRT friendly).
-        xmp.spawn(_mp_fn, args=(args,), nprocs=None)
+        # Try multiple strategies to pick nprocs so PJRT gets the expected worker count.
+        def _parse_expected_from_error(err_msg: str):
+            import re
+            m = re.search(r"Expected\s+(\d+)\s+worker addresses, got\s+(\d+)", str(err_msg))
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    return None
+            return None
+
+        def _parse_nprocs_from_env():
+            import os, re, json
+            for k in ("TPU_NUM_DEVICES", "NUM_TPU_DEVICES", "TPU_NUM_DEVICES_PER_HOST"):
+                v = os.environ.get(k)
+                if v and v.isdigit():
+                    return int(v)
+
+            cfg = os.environ.get("XRT_TPU_CONFIG") or os.environ.get("XLA_CONFIG")
+            if cfg:
+                try:
+                    parsed = json.loads(cfg)
+                    for key in ("worker_addresses", "local_service_addresses", "slice_builder_worker_addresses"):
+                        if key in parsed and isinstance(parsed[key], (list, tuple)):
+                            return len(parsed[key])
+                except Exception:
+                    hosts = re.findall(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:\d+", cfg)
+                    if hosts:
+                        return len(hosts)
+            return None
+
+        spawn_attempts = []
+        tried_nprocs = []
+
+        # 1) Let PJRT decide
+        try:
+            xmp.spawn(_mp_fn, args=(args,), nprocs=None)
+            spawn_attempts.append((None, "success"))
+            sys.exit(0)
+        except Exception as e:
+            spawn_attempts.append((None, str(e)))
+            expected = _parse_expected_from_error(e)
+
+        # 2) If error reported expected N workers, try that N
+        if 'expected' in locals() and expected:
+            tried_nprocs.append(expected)
+            try:
+                xmp.spawn(_mp_fn, args=(args,), nprocs=expected)
+                spawn_attempts.append((expected, "success"))
+                sys.exit(0)
+            except Exception as e2:
+                spawn_attempts.append((expected, str(e2)))
+
+        # 3) Try parsing environment
+        env_n = _parse_nprocs_from_env()
+        if env_n and env_n not in tried_nprocs:
+            tried_nprocs.append(env_n)
+            try:
+                xmp.spawn(_mp_fn, args=(args,), nprocs=env_n)
+                spawn_attempts.append((env_n, "success"))
+                sys.exit(0)
+            except Exception as e3:
+                spawn_attempts.append((env_n, str(e3)))
+
+        # No successful spawn attempt. Provide diagnostics and raise to avoid silent CPU fallback.
+        failures = "\n".join([f"nprocs={n}: {msg}" for n, msg in spawn_attempts])
+        env_info = {
+            'XRT_TPU_CONFIG': os.environ.get('XRT_TPU_CONFIG'),
+            'TPU_NUM_DEVICES': os.environ.get('TPU_NUM_DEVICES'),
+            'NUM_TPU_DEVICES': os.environ.get('NUM_TPU_DEVICES'),
+            'XLA_USE_BF16': os.environ.get('XLA_USE_BF16'),
+        }
+        raise RuntimeError(
+            "TPU spawn failed after trying several nprocs strategies.\n"
+            f"Attempts:\n{failures}\n"
+            f"Env diagnostics: {env_info}\n"
+            "Ensure the Kaggle TPU runtime is configured with the expected number of cores and XRT_TPU_CONFIG matches."
+        )
     else:
         global device, TPU_AVAILABLE
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
