@@ -24,16 +24,13 @@ from backup_manager import BackupManager
 
 # Try to import TPU libraries
 try:
-    import torch_xla.core.xla_model as xm
-    import torch_xla.distributed.parallel_loader as pl
     import torch_xla.distributed.xla_multiprocessing as xmp
     XLA_AVAILABLE = True
 except ImportError:
-    xm = None
-    pl = None
     xmp = None
     XLA_AVAILABLE = False
 
+device = None
 TPU_AVAILABLE = False
 
 #Define a custom learning rate scheduler with warmup.
@@ -219,7 +216,6 @@ def main(args):
                 azure_config=azure_cfg,
             )
     
-    device = xm.xla_device() if TPU_AVAILABLE else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
     charset = config['data']['charset']
@@ -349,13 +345,6 @@ def main(args):
     logger.info(f"Training completed. Best validation accuracy: {best_val_acc*100:.2f}%")
 
 if __name__ == "__main__":
-    TPU_AVAILABLE = False
-    if XLA_AVAILABLE:
-        try:
-            TPU_AVAILABLE = len(xm.get_xla_supported_devices()) > 0
-        except Exception:
-            TPU_AVAILABLE = False
-
     parser = argparse.ArgumentParser(description="Train Captcha Recognition Model")
     #Add command line arguments for configuration and checkpointing.
     parser.add_argument("--config", type=str, default="config.json", help="Path to the config file.")
@@ -375,10 +364,18 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    def _mp_fn(rank, args):
-        main(args)
+    if XLA_AVAILABLE:
+        def _mp_fn(rank, args):
+            global device, TPU_AVAILABLE
+            import torch_xla.core.xla_model as xm
+            import torch_xla.distributed.parallel_loader as pl
+            device = xm.xla_device()
+            TPU_AVAILABLE = True
+            main(args)
 
-    if TPU_AVAILABLE:
         xmp.spawn(_mp_fn, args=(args,))
     else:
+        global device, TPU_AVAILABLE
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        TPU_AVAILABLE = False
         main(args)
