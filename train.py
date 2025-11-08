@@ -58,14 +58,13 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
     progress_bar = tqdm(dataloader, desc="Training")
     
     for i, (images, labels_padded, label_lengths) in enumerate(progress_bar):
-        if not TPU_AVAILABLE:
-            images = images.to(device, non_blocking=True)
-            labels_padded = labels_padded.to(device, non_blocking=True)
-            label_lengths = label_lengths.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True)
+        labels_padded = labels_padded.to(device, non_blocking=True)
+        label_lengths = label_lengths.to(device, non_blocking=True)
         
         optimizer.zero_grad(set_to_none=True)
         
-        with autocast(device_type='xla' if TPU_AVAILABLE else 'cuda', enabled=config['training']['mixed_precision']):
+        with autocast(device_type='cuda', enabled=config['training']['mixed_precision']):
             preds = model(images)
             log_probs = F.log_softmax(preds, dim=2)
             input_lengths = torch.full(size=(images.size(0),), fill_value=log_probs.size(1), dtype=torch.long, device=device)
@@ -113,12 +112,11 @@ def validate(model, dataloader, criterion, decoder, device, config, charset):
     
     with torch.no_grad():
         for images, labels_padded, label_lengths in tqdm(dataloader, desc="Validating"):
-            if not TPU_AVAILABLE:
-                images = images.to(device, non_blocking=True)
-                labels_padded = labels_padded.to(device, non_blocking=True)
-                label_lengths = label_lengths.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=True)
+            labels_padded = labels_padded.to(device, non_blocking=True)
+            label_lengths = label_lengths.to(device, non_blocking=True)
             
-            with autocast(device_type='xla' if TPU_AVAILABLE else 'cuda', enabled=config['training']['mixed_precision']):
+            with autocast(device_type='cuda', enabled=config['training']['mixed_precision']):
                 preds = model(images)
                 log_probs = F.log_softmax(preds, dim=2)
                 input_lengths = torch.full(size=(images.size(0),), fill_value=log_probs.size(1), dtype=torch.long, device=device)
@@ -227,10 +225,6 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
 
-    if TPU_AVAILABLE:
-        train_loader = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
-        val_loader = pl.ParallelLoader(val_loader, [device]).per_device_loader(device)
-
     model = CRNN(
         vocab_size=len(charset), 
         hidden_size=config['model']['hidden_size'], 
@@ -238,6 +232,9 @@ def main(args):
         num_layers=config['model']['num_layers'],
         dropout=config['model']['dropout']
     ).to(device)
+    
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     
     logger.info(f"Model created. Total parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -269,7 +266,7 @@ def main(args):
     
     scheduler = WarmupScheduler(optimizer, warmup_steps, main_scheduler)
     
-    scaler = torch.amp.GradScaler(enabled=config['training']['mixed_precision'] and not TPU_AVAILABLE)
+    scaler = torch.amp.GradScaler(enabled=config['training']['mixed_precision'])
     decoder = CTCDecoder(charset)
 
     #Initialize variables for training.
@@ -365,13 +362,6 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if XLA_AVAILABLE:
-        import torch_xla.core.xla_model as xm
-        import torch_xla.distributed.parallel_loader as pl
-        device = xm.xla_device()
-        TPU_AVAILABLE = True
-        main(args)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        TPU_AVAILABLE = False
-        main(args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    TPU_AVAILABLE = False
+    main(args)
