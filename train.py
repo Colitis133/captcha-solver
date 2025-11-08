@@ -26,7 +26,7 @@ from backup_manager import BackupManager
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
-    TPU_AVAILABLE = xm.xla_device_count() > 0
+    TPU_AVAILABLE = True if xm.get_xla_supported_devices() else False
 except ImportError:
     xm = None
     pl = None
