@@ -20,7 +20,6 @@ import re
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-import re
 
 from model import CRNN
 from data import CaptchaDataset, collate_fn
@@ -37,6 +36,21 @@ except ImportError:
 
 #Define a custom learning rate scheduler with warmup.
 class WarmupScheduler:
+    def __init__(self, optimizer, warmup_steps, main_scheduler):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.main_scheduler = main_scheduler
+        self.current_step = 0
+        self.base_lr = optimizer.param_groups[0]['lr']
+        
+    def step(self):
+        self.current_step += 1
+        if self.current_step <= self.warmup_steps:
+            lr = self.base_lr * (self.current_step / self.warmup_steps)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            self.main_scheduler.step()
     def __init__(self, optimizer, warmup_steps, main_scheduler):
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
@@ -78,15 +92,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
             print(f"Warning: Skipping batch {i} due to NaN/Inf loss.")
             continue
             
-        if TPU_AVAILABLE:
-            loss.backward()
-            xm.optimizer_step(optimizer, barrier=False)
-        else:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
-            scaler.step(optimizer)
-            scaler.update()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
         
         total_loss += loss.item()
@@ -180,12 +190,10 @@ def ddp_main(rank, args):
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group(backend='nccl', rank=rank, world_size=torch.cuda.device_count())
     torch.cuda.set_device(rank)
-    TPU_AVAILABLE = False
     main(args, rank=rank)
 
 def main(args, rank=None):
     device = torch.device(f'cuda:{rank}') if rank is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    TPU_AVAILABLE = False
     
     config = load_config(args.config)
 
@@ -416,6 +424,4 @@ if __name__ == "__main__":
     if torch.cuda.device_count() > 1:
         torch.multiprocessing.spawn(ddp_main, args=(args,), nprocs=torch.cuda.device_count())
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        TPU_AVAILABLE = False
         main(args)
