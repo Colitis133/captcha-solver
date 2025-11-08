@@ -17,6 +17,7 @@ import json
 import numpy as np
 import math
 import sys
+import re
 
 from model import CRNN
 from data import CaptchaDataset, collate_fn
@@ -373,6 +374,12 @@ if __name__ == "__main__":
         default=None,
         help="Epoch interval for incremental backups (overrides config).",
     )
+    parser.add_argument(
+        "--auto-fix-tpu-env",
+        action="store_true",
+        default=False,
+        help="If spawn fails due to incomplete localservice XRT_TPU_CONFIG, attempt to synthesize full config and retry (opt-in).",
+    )
     args = parser.parse_args()
 
     if XLA_AVAILABLE:
@@ -381,13 +388,43 @@ if __name__ == "__main__":
         try:
             xmp.spawn(_mp_fn, args=(args,), nprocs=None)
         except Exception as e:
-            # Provide diagnostics and re-raise; do not fall back to CPU/GPU.
+            # If user opted in, try to auto-fix the common localservice single-address XRT_TPU_CONFIG
+            err_str = str(e)
             env_info = {
                 'XRT_TPU_CONFIG': os.environ.get('XRT_TPU_CONFIG'),
                 'TPU_NUM_DEVICES': os.environ.get('TPU_NUM_DEVICES'),
                 'NUM_TPU_DEVICES': os.environ.get('NUM_TPU_DEVICES'),
                 'XLA_CONFIG': os.environ.get('XLA_CONFIG'),
             }
+
+            # Pattern: Expected 8 worker addresses, got 1
+            m = re.search(r"Expected\s+(\d+)\s+worker addresses, got\s+(\d+)", err_str)
+            if args.auto_fix_tpu_env and m:
+                expected = int(m.group(1))
+                got = int(m.group(2))
+                cur = os.environ.get('XRT_TPU_CONFIG', '')
+                if cur.startswith('localservice') and got == 1 and expected > 1:
+                    # Try to synthesize a localservice list of localhost ports.
+                    # Common Kaggle ports start at 51011 for localservice.
+                    base_port = 51011
+                    ports = [str(base_port + i) for i in range(expected)]
+                    # Build 'localservice;0;localhost:51011,localhost:51012,...'
+                    addrs = ','.join([f'localhost:{p}' for p in ports])
+                    new_cfg = f'localservice;0;{addrs}'
+                    print(f"Auto-fix: setting XRT_TPU_CONFIG to: {new_cfg}")
+                    os.environ['XRT_TPU_CONFIG'] = new_cfg
+                    try:
+                        xmp.spawn(_mp_fn, args=(args,), nprocs=None)
+                        sys.exit(0)
+                    except Exception as e2:
+                        raise RuntimeError(
+                            "TPU spawn retry after auto-fix failed.\n"
+                            f"Original error: {e}\n"
+                            f"Retry error: {e2}\n"
+                            f"Tried XRT_TPU_CONFIG: {new_cfg}\n"
+                        )
+
+            # Otherwise, raise diagnostics and do not fall back.
             raise RuntimeError(
                 "TPU spawn (nprocs=None) failed.\n"
                 f"Error: {e}\n"
