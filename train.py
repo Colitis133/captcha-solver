@@ -58,9 +58,10 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
     progress_bar = tqdm(dataloader, desc="Training")
     
     for i, (images, labels_padded, label_lengths) in enumerate(progress_bar):
-        images = images.to(device, non_blocking=True)
-        labels_padded = labels_padded.to(device, non_blocking=True)
-        label_lengths = label_lengths.to(device, non_blocking=True)
+        if not TPU_AVAILABLE:
+            images = images.to(device, non_blocking=True)
+            labels_padded = labels_padded.to(device, non_blocking=True)
+            label_lengths = label_lengths.to(device, non_blocking=True)
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -111,9 +112,10 @@ def validate(model, dataloader, criterion, decoder, device, config, charset):
     
     with torch.no_grad():
         for images, labels_padded, label_lengths in tqdm(dataloader, desc="Validating"):
-            images = images.to(device, non_blocking=True)
-            labels_padded = labels_padded.to(device, non_blocking=True)
-            label_lengths = label_lengths.to(device, non_blocking=True)
+            if not TPU_AVAILABLE:
+                images = images.to(device, non_blocking=True)
+                labels_padded = labels_padded.to(device, non_blocking=True)
+                label_lengths = label_lengths.to(device, non_blocking=True)
             
             with autocast(device_type='xla' if TPU_AVAILABLE else 'cuda', enabled=config['training']['mixed_precision']):
                 preds = model(images)
@@ -223,6 +225,10 @@ def main(args):
 
     train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
     val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
+
+    if TPU_AVAILABLE:
+        train_loader = pl.MpDeviceLoader(train_loader, device)
+        val_loader = pl.MpDeviceLoader(val_loader, device)
 
     model = CRNN(
         vocab_size=len(charset), 
