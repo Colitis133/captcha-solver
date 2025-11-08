@@ -27,12 +27,14 @@ try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
     import torch_xla.distributed.xla_multiprocessing as xmp
-    TPU_AVAILABLE = True if xm.get_xla_supported_devices() else False
+    XLA_AVAILABLE = True
 except ImportError:
     xm = None
     pl = None
     xmp = None
-    TPU_AVAILABLE = False
+    XLA_AVAILABLE = False
+
+TPU_AVAILABLE = False
 
 #Define a custom learning rate scheduler with warmup.
 class WarmupScheduler:
@@ -347,6 +349,13 @@ def main(args):
     logger.info(f"Training completed. Best validation accuracy: {best_val_acc*100:.2f}%")
 
 if __name__ == "__main__":
+    TPU_AVAILABLE = False
+    if XLA_AVAILABLE:
+        try:
+            TPU_AVAILABLE = len(xm.get_xla_supported_devices()) > 0
+        except Exception:
+            TPU_AVAILABLE = False
+
     parser = argparse.ArgumentParser(description="Train Captcha Recognition Model")
     #Add command line arguments for configuration and checkpointing.
     parser.add_argument("--config", type=str, default="config.json", help="Path to the config file.")
@@ -370,7 +379,6 @@ if __name__ == "__main__":
         main(args)
 
     if TPU_AVAILABLE:
-        nprocs = len(xm.get_xla_supported_devices())
-        xmp.spawn(_mp_fn, args=(args,), nprocs=nprocs)
+        xmp.spawn(_mp_fn, args=(args,))
     else:
         main(args)
