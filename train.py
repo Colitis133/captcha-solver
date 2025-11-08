@@ -26,10 +26,12 @@ from backup_manager import BackupManager
 try:
     import torch_xla.core.xla_model as xm
     import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
     TPU_AVAILABLE = True if xm.get_xla_supported_devices() else False
 except ImportError:
     xm = None
     pl = None
+    xmp = None
     TPU_AVAILABLE = False
 
 #Define a custom learning rate scheduler with warmup.
@@ -363,4 +365,12 @@ if __name__ == "__main__":
         help="Epoch interval for incremental backups (overrides config).",
     )
     args = parser.parse_args()
-    main(args)
+
+    def _mp_fn(rank, args):
+        main(args)
+
+    if TPU_AVAILABLE:
+        nprocs = len(xm.get_xla_supported_devices())
+        xmp.spawn(_mp_fn, args=(args,), nprocs=nprocs)
+    else:
+        main(args)
