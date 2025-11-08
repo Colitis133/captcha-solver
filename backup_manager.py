@@ -222,7 +222,7 @@ class BackupManager:
         if rel_path in (".", ""):
             return False
         normalized = rel_path.strip("./")
-        skip_prefixes = {".git", "backups", "__pycache__"}
+        skip_prefixes = {".git", "backups", "__pycache__", "dataset"}
         return any(normalized.startswith(prefix) for prefix in skip_prefixes)
 
     def _generate_requirements_lock(self) -> None:
