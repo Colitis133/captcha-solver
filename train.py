@@ -167,6 +167,19 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best
 
     return os.path.abspath(checkpoint_path)
 
+
+# Multiprocessing entrypoint for TPUs must be a top-level function so it can be
+# pickled/imported by worker processes. Import torch_xla modules here to avoid
+# initializing XLA before spawn.
+def _mp_fn(index, args):
+    global device, TPU_AVAILABLE, pl, xm
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    device = xm.xla_device()
+    TPU_AVAILABLE = True
+    # Now run the normal main routine in the child process
+    main(args)
+
 #Main training loop.
 def main(args):
     config = load_config(args.config)
@@ -362,15 +375,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if XLA_AVAILABLE:
-        def _mp_fn(rank, args):
-            global device, TPU_AVAILABLE
-            import torch_xla.core.xla_model as xm
-            import torch_xla.distributed.parallel_loader as pl
-            device = xm.xla_device()
-            TPU_AVAILABLE = True
-            main(args)
-
-        xmp.spawn(_mp_fn, args=(args,))
+        # Use the module-level `_mp_fn` so it can be imported by worker processes.
+        # Use nprocs=None to let PJRT choose the correct number of replicas (Kaggle TPU/PJRT friendly).
+        xmp.spawn(_mp_fn, args=(args,), nprocs=None)
     else:
         global device, TPU_AVAILABLE
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
