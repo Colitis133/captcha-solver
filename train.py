@@ -78,7 +78,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
             
         if TPU_AVAILABLE:
             loss.backward()
-            xm.optimizer_step(optimizer)
+            xm.optimizer_step(optimizer, barrier=False)
         else:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -100,7 +100,8 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, con
             all_preds.extend(decoded_preds[:3])
             all_targets.extend(batch_targets[:3])
         
-        progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
+        if i % 10 == 0 or i == len(dataloader) - 1:
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.2e}")
         
     return total_loss / len(dataloader), all_preds, all_targets
 
@@ -223,8 +224,8 @@ def main(args):
     train_dataset = CaptchaDataset(config['data']['train_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=True)
     val_dataset = CaptchaDataset(config['data']['val_path'], charset, config['data']['image_height'], config['data']['image_width'], is_train=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE)
+    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
+    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=8, collate_fn=collate_fn, pin_memory=not TPU_AVAILABLE, prefetch_factor=4)
 
     if TPU_AVAILABLE:
         train_loader = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
