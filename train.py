@@ -165,6 +165,10 @@ def main(args):
         if env_name:
             os.environ[env_name] = args.azure_connection_string
 
+    if args.backup_interval is not None:
+        backup_section = config.setdefault('backup', {})
+        backup_section['incremental_interval'] = args.backup_interval
+
     base_dir = Path(__file__).resolve().parent
     for key in ['model_save', 'checkpoint_dir', 'log_dir']:
         if key in config['paths']:
@@ -331,6 +335,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Azure storage connection string to override config/env settings for backups.",
+    )
+    parser.add_argument(
+        "--backup-interval",
+        type=int,
+        default=None,
+        help="Epoch interval for incremental backups (overrides config).",
     )
     args = parser.parse_args()
     main(args)
