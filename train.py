@@ -306,6 +306,17 @@ def main(args, rank=None):
     start_epoch = 0
     last_checkpoint_path = None
     
+    # Auto-resume from latest checkpoint if available
+    if (rank == 0 or rank is None):
+        checkpoint_dir = Path(config['paths']['checkpoint_dir'])
+        if checkpoint_dir.exists():
+            checkpoints = list(checkpoint_dir.glob('checkpoint_epoch_*.pt'))
+            if checkpoints:
+                latest = max(checkpoints, key=lambda p: int(p.stem.split('_')[-1]))
+                args.resume = str(latest)
+                if logger:
+                    logger.info(f"Auto-resuming from latest checkpoint: {latest}")
+    
     #Load checkpoint if resuming training.
     if args.resume and (rank == 0 or rank is None):
         if os.path.isfile(args.resume):
