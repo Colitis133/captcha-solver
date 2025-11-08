@@ -11,3 +11,4 @@ seaborn
 pandas
 onnx
 onnxruntime
+azure-storage-blob

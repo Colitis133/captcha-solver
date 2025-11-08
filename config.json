@@ -40,5 +40,18 @@
     "early_stopping_patience": 20,
     "save_best_only": true,
     "monitor": "char_accuracy"
+  },
+  "backup": {
+    "enabled": true,
+    "run_folder_prefix": "run",
+    "baseline_epoch": 3,
+    "incremental_interval": 10,
+    "incremental_directories": ["checkpoints", "models", "logs"],
+    "incremental_files": ["config.json", "backup_state.json", "requirements-lock.txt"],
+    "azure": {
+      "connection_string_env": "AZURE_STORAGE_CONNECTION_STRING",
+      "container": "captcha-backups",
+      "path_prefix": ""
+    }
   }
 }

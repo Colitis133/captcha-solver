@@ -11,6 +11,7 @@ from torch.amp import GradScaler, autocast
 import argparse
 import os
 import time
+from pathlib import Path
 from tqdm import tqdm
 import json
 import numpy as np
@@ -19,6 +20,7 @@ import math
 from model import CRNN
 from data import CaptchaDataset, collate_fn
 from utils import CTCDecoder, Metrics, setup_logger, load_config
+from backup_manager import BackupManager
 
 #Define a custom learning rate scheduler with warmup.
 class WarmupScheduler:
@@ -126,7 +128,7 @@ def validate(model, dataloader, criterion, decoder, device, config, charset):
     return total_loss / len(dataloader), val_cer, val_seq_acc, val_char_acc, all_preds, all_targets
 
 #Save the model checkpoint.
-def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best=False):
+def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best=False, previous_checkpoint=None):
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -137,15 +139,61 @@ def save_checkpoint(model, optimizer, scheduler, epoch, val_acc, config, is_best
     
     checkpoint_path = os.path.join(config['paths']['checkpoint_dir'], f'checkpoint_epoch_{epoch}.pt')
     os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
+    if previous_checkpoint:
+        prev_path = os.fspath(previous_checkpoint)
+        if os.path.exists(prev_path) and os.path.abspath(prev_path) != os.path.abspath(checkpoint_path):
+            try:
+                os.remove(prev_path)
+            except OSError:
+                pass
     torch.save(checkpoint, checkpoint_path)
     
     if is_best:
         torch.save(model.state_dict(), config['paths']['model_save'])
 
+    return os.path.abspath(checkpoint_path)
+
 #Main training loop.
 def main(args):
     config = load_config(args.config)
+
+    if args.azure_connection_string:
+        backup_section = config.setdefault('backup', {})
+        azure_section = backup_section.setdefault('azure', {})
+        azure_section['connection_string'] = args.azure_connection_string
+        env_name = azure_section.get('connection_string_env')
+        if env_name:
+            os.environ[env_name] = args.azure_connection_string
+
+    base_dir = Path(__file__).resolve().parent
+    for key in ['model_save', 'checkpoint_dir', 'log_dir']:
+        if key in config['paths']:
+            config['paths'][key] = str((base_dir / config['paths'][key]).resolve())
+    best_model_path = Path(config['paths']['model_save'])
+    os.makedirs(best_model_path.parent, exist_ok=True)
+    os.makedirs(config['paths']['checkpoint_dir'], exist_ok=True)
+    os.makedirs(config['paths']['log_dir'], exist_ok=True)
+
     logger = setup_logger(config['paths']['log_dir'])
+
+    backup_cfg = config.get('backup', {}) or {}
+    backup_manager = None
+    if backup_cfg.get('enabled'):
+        azure_cfg = backup_cfg.get('azure') or {}
+        if not azure_cfg:
+            logger.warning("Backup enabled but no Azure configuration provided; disabling backups.")
+        else:
+            backup_manager = BackupManager(
+                base_dir=base_dir,
+                logger=logger,
+                enabled=True,
+                run_folder_prefix=backup_cfg.get('run_folder_prefix', 'run'),
+                baseline_epoch=backup_cfg.get('baseline_epoch', 3),
+                incremental_interval=backup_cfg.get('incremental_interval', 10),
+                incremental_directories=backup_cfg.get('incremental_directories'),
+                incremental_files=backup_cfg.get('incremental_files'),
+                azure_config=azure_cfg,
+            )
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -203,14 +251,14 @@ def main(args):
     best_val_acc = 0
     patience_counter = 0
     start_epoch = 0
+    last_checkpoint_path = None
     
-    os.makedirs(os.path.dirname(config['paths']['model_save']), exist_ok=True)
-
     #Load checkpoint if resuming training.
     if args.resume:
         if os.path.isfile(args.resume):
-            logger.info(f"Loading checkpoint '{args.resume}'")
-            checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
+            resume_path = Path(args.resume).resolve()
+            logger.info(f"Loading checkpoint '{resume_path}'")
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=True)
             start_epoch = checkpoint['epoch'] + 1
             best_val_acc = checkpoint.get('val_acc', 0)
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -218,6 +266,7 @@ def main(args):
             if 'scheduler_state_dict' in checkpoint and hasattr(scheduler, 'main_scheduler'):
                  scheduler.main_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             logger.info(f"Resuming from epoch {start_epoch}")
+            last_checkpoint_path = resume_path
         else:
             logger.info(f"No checkpoint found at '{args.resume}', starting from scratch.")
 
@@ -249,7 +298,21 @@ def main(args):
             patience_counter += 1
             
         if epoch % 10 == 0 or is_best:
-            save_checkpoint(model, optimizer, scheduler, epoch, val_char_acc, config, is_best)
+            last_checkpoint_path = Path(
+                save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                val_char_acc,
+                config,
+                is_best,
+                    previous_checkpoint=last_checkpoint_path,
+                )
+            )
+        if backup_manager:
+            checkpoint_path_obj = last_checkpoint_path if last_checkpoint_path else None
+            backup_manager.maybe_backup(epoch + 1, checkpoint_path_obj, best_model_path)
             
         if patience_counter >= config['validation']['early_stopping_patience']:
             logger.info("Early stopping triggered.")
@@ -263,5 +326,11 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="config.json", help="Path to the config file.")
     #Add argument for resuming training from a checkpoint.
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from.")
+    parser.add_argument(
+        "--azure-connection-string",
+        type=str,
+        default=None,
+        help="Azure storage connection string to override config/env settings for backups.",
+    )
     args = parser.parse_args()
     main(args)
